@@ -161,6 +161,23 @@ class Worker(QThread):
             self.failed.emit(str(e))
 
 
+class DownloadWorker(QThread):
+    """run_job's on_progress fires from this thread -- can't touch Qt
+    widgets directly from there (undefined/unsafe: Qt widgets only have
+    thread affinity for the GUI thread). Routes progress through a
+    signal instead, which Qt auto-queues across threads safely."""
+    progress = pyqtSignal(object)
+    finished_ok = pyqtSignal(bool)
+
+    def __init__(self, job):
+        super().__init__()
+        self.job = job
+
+    def run(self):
+        ok = download_manager.run_job(self.job, on_progress=lambda j: self.progress.emit(j))
+        self.finished_ok.emit(ok)
+
+
 class AniAni(QWidget):
     def __init__(self):
         super().__init__()
@@ -211,6 +228,8 @@ class AniAni(QWidget):
         self.rpc_timer.start(5000)
 
         self.download_jobs = []
+        self._pending_downloads = []  # [(job, ep), ...] awaiting their turn
+        self._active_download_job = None  # only one ffmpeg download runs at a time
 
         kill_lingering_rpc_daemon()
         self._refresh_history()
@@ -346,9 +365,30 @@ class AniAni(QWidget):
     def _nyaa_search_done(self, results):
         self.status.setText(f"{len(results)} releases" if results else "no results (nyaa.si can be flaky -- try again)")
         for r in results:
-            item = QListWidgetItem(f"{r['title'][:60]}  ·  {r['size']}  ·  {r['seeders']} seeders")
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, r)
+            # plain single-line item text doesn't wrap, and release titles
+            # + size + seeders together are routinely wider than the panel
+            # -- was overflowing into a horizontal scrollbar instead of
+            # reading cleanly. A real two-line row wraps the title and
+            # keeps size/seeders on their own muted line underneath.
+            row = self._two_line_row(r["title"], f"{r['size']} · {r['seeders']} seeders")
+            item.setSizeHint(row.sizeHint())
             self.results_list.addItem(item)
+            self.results_list.setItemWidget(item, row)
+
+    def _two_line_row(self, primary_text, secondary_text):
+        row = QWidget()
+        rv = QVBoxLayout(row)
+        rv.setContentsMargins(6, 4, 6, 4)
+        rv.setSpacing(2)
+        primary = QLabel(primary_text)
+        primary.setWordWrap(True)
+        rv.addWidget(primary)
+        secondary = QLabel(secondary_text)
+        secondary.setObjectName("status")
+        rv.addWidget(secondary)
+        return row
 
     def _result_selected(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
@@ -455,7 +495,20 @@ class AniAni(QWidget):
     def _queue_download(self, ep):
         job = download_manager.DownloadJob(self.anime_title, ep["ep_no"], None, None)
         self.download_jobs.append(job)
+        self._pending_downloads.append((job, ep))
         self._refresh_downloads_list()
+        self._advance_download_queue()
+
+    def _advance_download_queue(self):
+        # only one ffmpeg download runs at a time -- "download whole
+        # series" was firing every episode's download concurrently
+        # instead (confirmed: watched 6+ real ffmpeg processes running
+        # at once from a live test), despite this being the whole point
+        # of a queue. Each episode now waits its turn.
+        if self._active_download_job is not None or not self._pending_downloads:
+            return
+        job, ep = self._pending_downloads.pop(0)
+        self._active_download_job = job
         src = SOURCES[self.source_name]
         worker = Worker(src.watch, ep["ep_ref"], self.mode)
         worker.done.connect(lambda w, j=job: self._start_download_job(j, w))
@@ -470,14 +523,26 @@ class AniAni(QWidget):
             return
         job.url = watch_result["url"]
         job.referer = watch_result.get("referer")
-        worker = Worker(download_manager.run_job, job, lambda j: self._refresh_downloads_list())
+        worker = DownloadWorker(job)
+        # progress fires from the worker thread -- Qt auto-queues signal
+        # delivery across threads, so this is safe where a raw callback
+        # calling GUI methods directly (the previous approach) wasn't.
+        worker.progress.connect(lambda j: self._refresh_downloads_list())
+        worker.finished_ok.connect(lambda ok, j=job: self._on_download_finished(j))
         worker.start()
+        job.worker = worker  # keep the QThread alive (and reachable to cancel)
         self._dl_run_workers = getattr(self, "_dl_run_workers", [])
         self._dl_run_workers.append(worker)
 
     def _fail_job(self, job, err):
         job.status = "failed"
+        self._on_download_finished(job)
+
+    def _on_download_finished(self, job):
+        if self._active_download_job is job:
+            self._active_download_job = None
         self._refresh_downloads_list()
+        self._advance_download_queue()
 
     # ---------- downloads page ----------
 
@@ -499,8 +564,48 @@ class AniAni(QWidget):
     def _refresh_downloads_list(self):
         self.downloads_list.clear()
         for job in self.download_jobs:
-            label = f"{job.anime_title} · Episode {job.ep_no} — {job.status} ({job.progress*100:.0f}%)"
-            self.downloads_list.addItem(label)
+            row = QWidget()
+            rv = QVBoxLayout(row)
+            rv.setContentsMargins(6, 4, 6, 4)
+            rv.setSpacing(4)
+
+            top = QHBoxLayout()
+            title = QLabel(f"{job.anime_title} · Episode {job.ep_no}")
+            title.setWordWrap(True)
+            top.addWidget(title, 1)
+            if job.status in ("queued", "downloading"):
+                cancel_btn = QPushButton("✕")
+                cancel_btn.setFixedWidth(28)
+                cancel_btn.setToolTip("Cancel download")
+                cancel_btn.clicked.connect(lambda _, j=job: self._cancel_download(j))
+                top.addWidget(cancel_btn)
+            rv.addLayout(top)
+
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(int(job.progress * 100))
+            bar.setTextVisible(False)
+            bar.setFixedHeight(6)
+            rv.addWidget(bar)
+
+            status = QLabel(f"{job.status} · {job.progress*100:.0f}%")
+            status.setObjectName("status")
+            rv.addWidget(status)
+
+            item = QListWidgetItem()
+            item.setSizeHint(row.sizeHint())
+            self.downloads_list.addItem(item)
+            self.downloads_list.setItemWidget(item, row)
+
+    def _cancel_download(self, job):
+        # still waiting its turn in the queue -- no ffmpeg process exists
+        # yet, just drop it rather than starting it only to kill it
+        self._pending_downloads = [(j, e) for j, e in self._pending_downloads if j is not job]
+        job.cancel()  # no-op if it was never running; kills ffmpeg if it was
+        if self._active_download_job is job:
+            self._active_download_job = None
+            self._advance_download_queue()
+        self._refresh_downloads_list()
 
     # ---------- offline library ----------
 

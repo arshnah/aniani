@@ -71,8 +71,21 @@ class VlcPlayer:
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def stop(self):
+        # VLC under -I dummy doesn't always exit cleanly on SIGTERM,
+        # especially mid-stream (network I/O cleanup can hang) --
+        # reported directly: it lingers as a process after Stop/close.
+        # Escalate to SIGKILL if it doesn't exit promptly instead of
+        # leaving a zombie.
         if self.is_running():
             self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
         self.proc = None
 
     def _status(self, command=None, **params):

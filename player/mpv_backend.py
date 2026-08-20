@@ -194,4 +194,12 @@ class MpvPlayer:
             self._conn = None
         if self.is_running():
             self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
         self.proc = None
