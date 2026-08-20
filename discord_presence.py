@@ -28,13 +28,18 @@ query ($search: String) {
 BROWSING_ICON = "https://cdn.simpleicons.org/myanimelist"
 
 
+# aniani's own Discord Application, shared by every install so RPC works
+# out of the box with zero setup -- there's nothing secret in a client
+# id, it's just a public app identifier (this is how most open-source
+# RPC-enabled tools ship: one baked-in id, not a per-user registration).
+# config.json can still override it for anyone self-hosting under their
+# own Discord app.
+DEFAULT_CLIENT_ID = "1539979776322965555"
+
+
 def load_config():
     if not os.path.exists(CONFIG_PATH):
-        raise SystemExit(
-            f"Missing config file at {CONFIG_PATH}.\n"
-            "Create a Discord application at https://discord.com/developers/applications, "
-            'copy its Client ID, and write {"client_id": "..."} to that file.'
-        )
+        return {"client_id": DEFAULT_CLIENT_ID}
     with open(CONFIG_PATH) as f:
         return json.load(f)
 
@@ -91,10 +96,7 @@ class DiscordPresence:
     def ensure_connected(self):
         if self.connected:
             return True
-        try:
-            config = load_config()
-        except SystemExit:
-            return False
+        config = load_config()  # always returns a dict now (falls back to DEFAULT_CLIENT_ID)
         try:
             self.rpc = Presence(config["client_id"])
             self.rpc.connect()

@@ -135,10 +135,12 @@ def kill_lingering_rpc_daemon():
 
 def spawn_rpc_daemon(backend_name):
     try:
-        proc = platform_utils.popen_detached(
-            [sys.executable, os.path.join(DIR, "rpc_daemon.py"), "--backend", backend_name],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        if getattr(sys, "frozen", False):
+            # frozen exe: sys.executable is aniani.exe itself
+            args = [sys.executable, "--rpc-daemon", "--backend", backend_name]
+        else:
+            args = [sys.executable, os.path.join(DIR, "gui.py"), "--rpc-daemon", "--backend", backend_name]
+        proc = platform_utils.popen_detached(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(DAEMON_PID_PATH, "w") as f:
             f.write(str(proc.pid))
     except OSError:
@@ -770,12 +772,22 @@ class AniAni(QWidget):
         key = state.position_key(self.source_name, self.anime_title, self.current_ep_no)
         resume_at = positions.get(key)
 
-        self.player.play(
-            watch_result["url"],
-            title=f"{self.anime_title} Episode {self.current_ep_no}",
-            referer=watch_result.get("referer"),
-            start_seconds=resume_at if resume_at and resume_at > state.RESUME_MIN_SECONDS else None,
-        )
+        try:
+            self.player.play(
+                watch_result["url"],
+                title=f"{self.anime_title} Episode {self.current_ep_no}",
+                referer=watch_result.get("referer"),
+                start_seconds=resume_at if resume_at and resume_at > state.RESUME_MIN_SECONDS else None,
+            )
+        except (OSError, FileNotFoundError):
+            # e.g. VLC/mpv isn't installed -- this used to be an uncaught
+            # exception in a Qt slot instead of a message the user could
+            # actually act on.
+            self.now_status.setText(
+                f"{self.player_name} not found -- install it "
+                f"({'videolan.org/vlc' if self.player_name == 'vlc' else 'mpv.io'}) and try again"
+            )
+            return
         self.now_status.setText("playing" + (f" (resuming from {int(resume_at)}s)" if resume_at else ""))
         state.update_history(self.source_name, self.anime_id, self.anime_title, self.current_ep_no)
         state.save_last_session(self.source_name, self.anime_id, self.anime_title, self.current_ep_no)
@@ -942,4 +954,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # in a frozen PyInstaller exe, sys.executable IS aniani.exe -- there's
+    # no separate python.exe or loose rpc_daemon.py file to point spawn_
+    # rpc_daemon() at. Re-invoking ourselves with a mode flag handles both
+    # the frozen exe and normal `python3 gui.py` dev runs the same way.
+    if "--rpc-daemon" in sys.argv:
+        sys.argv.remove("--rpc-daemon")
+        import rpc_daemon
+        rpc_daemon.main()
+    else:
+        main()

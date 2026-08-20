@@ -4,6 +4,16 @@ A floating GUI for searching, watching, and downloading anime -- search →
 episode list → play, with continue-watching, resume-from-timestamp,
 skip-intro, and always-on Discord Rich Presence.
 
+## Windows, no Python needed
+
+Grab `aniani.exe` from the [Releases page](../../releases) -- built
+automatically by GitHub Actions, no installation, nothing else to set
+up. Discord Rich Presence works out of the box (no Discord Developer
+account needed, it uses aniani's own shared app id). You'll still want
+**VLC** (recommended) or **mpv** installed for actual playback, and
+optionally **ffmpeg** for downloads -- aniani will tell you clearly if
+one's missing rather than failing silently.
+
 ## Sources
 
 - **anidb.app** (default) -- scraped directly, no login, generally
