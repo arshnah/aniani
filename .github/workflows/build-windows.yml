@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
+permissions:
+  contents: write  # softprops/action-gh-release needs this to create the release; default token grants read-only
+
 jobs:
   build:
     runs-on: windows-latest
