@@ -36,14 +36,30 @@ jobs:
       - name: Smoke test -- actually launch it and confirm it doesn't crash
         shell: pwsh
         run: |
-          $proc = Start-Process -FilePath "dist\aniani.exe" -PassThru
+          # console=False in the spec means no window to read output from
+          # if it crashes -- redirect stdout/stderr to files so a failure
+          # here is actually diagnosable instead of just "exit code 1".
+          $proc = Start-Process -FilePath "dist\aniani.exe" -PassThru `
+            -RedirectStandardOutput "smoke-stdout.log" -RedirectStandardError "smoke-stderr.log"
           Start-Sleep -Seconds 8
           if ($proc.HasExited) {
+            Write-Host "---- stdout ----"
+            Get-Content "smoke-stdout.log" -ErrorAction SilentlyContinue
+            Write-Host "---- stderr ----"
+            Get-Content "smoke-stderr.log" -ErrorAction SilentlyContinue
             Write-Error "aniani.exe exited on its own within 8s (exit code $($proc.ExitCode)) -- treating as a crash"
             exit 1
           }
           Write-Host "aniani.exe is still running after 8s, looks alive"
           Stop-Process -Id $proc.Id -Force
+
+      - name: Upload smoke test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-logs
+          path: smoke-std*.log
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:
