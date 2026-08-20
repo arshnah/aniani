@@ -2,16 +2,28 @@
 SCRAPING section -- same endpoints, same regex approach, reimplemented so a
 GUI can call it directly instead of driving ani-cli's fzf menu flow.
 """
+import os
 import re
 import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import platform_utils  # noqa: E402
 
 NAME = "anidb"
-CURL = "curl_chrome136"
+# anidb.app rejects plain curl's TLS fingerprint (403) -- curl-impersonate
+# is required to get past it, on every platform, not just Linux.
+CURL = platform_utils.find_curl_impersonate()
 AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 BASE = "https://anidb.app"
 
 
 def _curl(url, timeout=12):
+    if not CURL:
+        raise RuntimeError(
+            "curl_chrome136 (curl-impersonate) not found on PATH -- required for anidb.app "
+            "(plain curl gets a 403 from its anti-bot check). Install it and retry."
+        )
     r = subprocess.run(
         [CURL, "-sL", "-A", AGENT, "--max-time", str(timeout), url],
         capture_output=True, text=True, timeout=timeout + 5,

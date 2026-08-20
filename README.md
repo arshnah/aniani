@@ -50,8 +50,8 @@ that daemon and takes back over.
 
 Needs `curl_chrome136` (curl-impersonate, for anidb.app), `vlc` and/or
 `mpv`, `qbittorrent-nox` (for the nyaa.si source), `ani-skip` (optional,
-for anidb.app's skip-intro), and Python deps: `PyQt6`, `requests`,
-`httpx`, `beautifulsoup4`, `tqdm`, `pypresence`.
+for anidb.app's skip-intro), and the Python deps in `requirements.txt`
+(`pip install -r requirements.txt`).
 
 Create a Discord Application at
 <https://discord.com/developers/applications> and write its client ID to
@@ -60,3 +60,28 @@ Create a Discord Application at
 ```json
 { "client_id": "..." }
 ```
+
+## Platform support
+
+Built and daily-driven on Linux (Arch/Hyprland). Windows support exists
+-- every OS-specific decision (state/download directories, mpv IPC via
+a named pipe instead of a Unix socket, binary discovery for
+vlc/mpv/ffmpeg/curl-impersonate/ani-skip/qbittorrent, detached-process
+spawning for the RPC daemon handoff) is centralized in
+`platform_utils.py` and follows documented Windows conventions
+(`%LOCALAPPDATA%`, `\\.\pipe\...`, `DETACHED_PROCESS`), but **hasn't
+been run on an actual Windows machine** -- treat it as "should work,
+needs real testing," and file/fix issues as they turn up. A couple of
+things are known-different there rather than broken:
+
+- `qbittorrent-nox` has no official Windows build; falls back to the
+  regular qBittorrent GUI, which shows a window (same WebUI API
+  underneath, just not headless).
+- `curl-impersonate` (`curl_chrome136`) needs a separate Windows binary
+  on PATH -- it doesn't ship with Windows the way plain `curl.exe` does
+  since 10 1803.
+
+macOS: untested and not a current target, though most of the same
+`platform_utils.py` groundwork (state dirs, Unix-socket mpv IPC) should
+carry over -- binary discovery paths for vlc/mpv would need macOS
+`/Applications` fallbacks added if anyone wants to pick that up.

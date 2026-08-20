@@ -6,13 +6,23 @@ offline/whole-season downloads -- same mechanism, just don't stop early).
 """
 import os
 import subprocess
+import sys
 import time
 
 import requests
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import platform_utils  # noqa: E402
+
 WEBUI_PORT = 8095
 WEBUI_BASE = f"http://127.0.0.1:{WEBUI_PORT}"
-DOWNLOAD_DIR = os.path.expanduser("~/Videos/aniani-torrents")
+DOWNLOAD_DIR = platform_utils.downloads_dir("aniani-torrents")
+QBT_PROFILE_DIR = os.path.join(platform_utils.state_dir("aniani"), "qbt-profile")
+# qbittorrent-nox has no official Windows build -- find_qbittorrent_nox()
+# falls back to the regular qBittorrent GUI there, which supports the
+# same flags/WebUI API but will show a window (there's no way around
+# that without a nox-equivalent build; documented, not a bug)
+QBT_BIN = platform_utils.find_qbittorrent_nox() or "qbittorrent-nox"
 STREAM_BUFFER_PERCENT = 3.0  # start playback once this much of the torrent has downloaded
 
 VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".webm")
@@ -30,7 +40,7 @@ class TorrentEngine:
             return True
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         self.proc = subprocess.Popen(
-            ["qbittorrent-nox", f"--webui-port={WEBUI_PORT}", "--profile=" + os.path.expanduser("~/.local/share/aniani-qbt")],
+            [QBT_BIN, f"--webui-port={WEBUI_PORT}", f"--profile={QBT_PROFILE_DIR}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         for _ in range(20):

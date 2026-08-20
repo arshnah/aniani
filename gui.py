@@ -19,7 +19,6 @@
   instead of restarting when the panel reopens.
 """
 import os
-import shutil
 import subprocess
 import sys
 
@@ -43,27 +42,74 @@ import torrent_backend
 import discord_presence
 import state
 import download_manager
+import platform_utils
 
 DIR = os.path.dirname(os.path.abspath(__file__))
-DAEMON_PID_PATH = "/tmp/aniani-rpc-daemon.pid"
+DAEMON_PID_PATH = platform_utils.temp_path("aniani-rpc-daemon.pid")
 
 SOURCES = {"anidb": anidb_source, "yuma": yuma_source}
 
 DARK_QSS = """
 QWidget { background: #0d0f12; color: #e8ebf0; font-size: 13px; }
-QLineEdit, QListWidget, QComboBox { background: #14171c; border: 1px solid #232830; border-radius: 6px; padding: 6px; }
-QListWidget::item { padding: 7px 4px; border-bottom: 1px solid #1b1f26; }
-QListWidget::item:selected { background: #232830; color: #8fb6ff; }
-QPushButton { background: #1b1f26; border: 1px solid #232830; border-radius: 6px; padding: 7px 12px; }
-QPushButton:hover { border-color: #8fb6ff; }
-QPushButton:disabled { color: #5a626e; }
-QLabel#heading { color: #8b93a1; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; }
+
+QLabel#brand { font-size: 20px; font-weight: 700; color: #f2f4f7; padding: 2px 0 4px 0; }
+QLabel#heading { color: #7d8590; font-size: 10.5px; font-weight: 600; letter-spacing: 1px; }
 QLabel#title { font-size: 16px; font-weight: 600; }
-QLabel#status { color: #8b93a1; }
+QLabel#status { color: #8b93a1; font-size: 12px; }
+
+QLineEdit {
+    background: #14171c; border: 1px solid #232830; border-radius: 8px;
+    padding: 9px 10px; selection-background-color: #8fb6ff; selection-color: #0d0f12;
+}
+QLineEdit:focus { border-color: #8fb6ff; }
+
+QComboBox {
+    background: #14171c; border: 1px solid #232830; border-radius: 8px; padding: 7px 10px;
+}
+QComboBox:hover { border-color: #3a4048; }
+QComboBox::drop-down { border: none; width: 22px; }
+QComboBox QAbstractItemView {
+    background: #171a20; border: 1px solid #232830; border-radius: 6px;
+    selection-background-color: #232830; selection-color: #8fb6ff; outline: none; padding: 4px;
+}
+
+QListWidget {
+    background: #12151a; border: 1px solid #1e222a; border-radius: 10px; padding: 4px;
+    outline: none;
+}
+QListWidget::item { padding: 9px 8px; border-radius: 6px; margin: 1px 0; }
+QListWidget::item:hover { background: #181c23; }
+QListWidget::item:selected { background: #1c2530; color: #8fb6ff; }
+
+QPushButton {
+    background: #171a20; border: 1px solid #262b33; border-radius: 8px;
+    padding: 8px 14px; font-weight: 500;
+}
+QPushButton:hover { border-color: #8fb6ff; color: #cfe0ff; }
+QPushButton:pressed { background: #101317; }
+QPushButton:disabled { color: #4a4f57; border-color: #1c2027; }
+QPushButton#primary { background: #8fb6ff; color: #0d0f12; border: none; font-weight: 600; }
+QPushButton#primary:hover { background: #a3c4ff; color: #0d0f12; }
+QPushButton#primary:pressed { background: #7ba3ee; }
+
+QCheckBox { spacing: 8px; padding: 2px 0; }
+QCheckBox::indicator {
+    width: 16px; height: 16px; border-radius: 4px; border: 1px solid #2b313b; background: #14171c;
+}
+QCheckBox::indicator:checked { background: #8fb6ff; border-color: #8fb6ff; }
+
 QSlider::groove:horizontal { background: #232830; height: 4px; border-radius: 2px; }
-QSlider::handle:horizontal { background: #8fb6ff; width: 12px; margin: -5px 0; border-radius: 6px; }
-QProgressBar { background: #14171c; border: 1px solid #232830; border-radius: 4px; text-align: center; }
-QProgressBar::chunk { background: #8fb6ff; }
+QSlider::sub-page:horizontal { background: #8fb6ff; height: 4px; border-radius: 2px; }
+QSlider::handle:horizontal { background: #e8ebf0; width: 13px; height: 13px; margin: -5px 0; border-radius: 7px; }
+QSlider::handle:horizontal:hover { background: #8fb6ff; }
+
+QProgressBar { background: #14171c; border: 1px solid #232830; border-radius: 6px; text-align: center; height: 16px; }
+QProgressBar::chunk { background: #8fb6ff; border-radius: 5px; }
+
+QScrollBar:vertical { background: transparent; width: 9px; margin: 2px; }
+QScrollBar::handle:vertical { background: #262b33; border-radius: 4px; min-height: 24px; }
+QScrollBar::handle:vertical:hover { background: #363c46; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 
 
@@ -78,7 +124,7 @@ def kill_lingering_rpc_daemon():
     try:
         with open(DAEMON_PID_PATH) as f:
             pid = int(f.read().strip())
-        os.kill(pid, 15)
+        platform_utils.kill_pid(pid)
     except (OSError, ValueError):
         pass
     try:
@@ -89,9 +135,9 @@ def kill_lingering_rpc_daemon():
 
 def spawn_rpc_daemon(backend_name):
     try:
-        proc = subprocess.Popen(
+        proc = platform_utils.popen_detached(
             [sys.executable, os.path.join(DIR, "rpc_daemon.py"), "--backend", backend_name],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         with open(DAEMON_PID_PATH, "w") as f:
             f.write(str(proc.pid))
@@ -187,32 +233,53 @@ class AniAni(QWidget):
     def _build_home(self):
         w = QWidget()
         v = QVBoxLayout(w)
+        v.setSpacing(10)
 
-        top_row = QHBoxLayout()
+        brand = QLabel("aniani")
+        brand.setObjectName("brand")
+        v.addWidget(brand)
+
+        prefs_row = QHBoxLayout()
+        prefs_row.setSpacing(10)
+        source_col = QVBoxLayout()
+        source_col.setSpacing(3)
+        source_label = QLabel("SOURCE")
+        source_label.setObjectName("heading")
         self.source_combo = QComboBox()
         self.source_combo.addItems(["anidb", "yuma", "nyaa (torrent)"])
         self.source_combo.currentTextChanged.connect(self._on_source_changed)
+        source_col.addWidget(source_label)
+        source_col.addWidget(self.source_combo)
+        player_col = QVBoxLayout()
+        player_col.setSpacing(3)
+        player_label = QLabel("PLAYER")
+        player_label.setObjectName("heading")
         self.player_combo = QComboBox()
         self.player_combo.addItems(["vlc", "mpv"])
         self.player_combo.currentTextChanged.connect(self._on_player_changed)
-        top_row.addWidget(self.source_combo)
-        top_row.addWidget(self.player_combo)
-        v.addLayout(top_row)
+        player_col.addWidget(player_label)
+        player_col.addWidget(self.player_combo)
+        prefs_row.addLayout(source_col, 1)
+        prefs_row.addLayout(player_col, 1)
+        v.addLayout(prefs_row)
 
         search_row = QHBoxLayout()
+        search_row.setSpacing(8)
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("search anime…")
         self.search_box.returnPressed.connect(self._do_search)
         search_btn = QPushButton("Search")
+        search_btn.setObjectName("primary")
         search_btn.clicked.connect(self._do_search)
-        search_row.addWidget(self.search_box)
+        search_row.addWidget(self.search_box, 1)
         search_row.addWidget(search_btn)
         v.addLayout(search_row)
 
         nav_row = QHBoxLayout()
-        dl_btn = QPushButton("Downloads")
+        nav_row.setSpacing(8)
+        dl_btn = QPushButton("⬇ Downloads")
         dl_btn.clicked.connect(lambda: self.stack.setCurrentWidget(self.downloads_page))
-        lib_btn = QPushButton("Offline Library")
+        lib_btn = QPushButton("▤ Offline Library")
         lib_btn.clicked.connect(self._open_library)
         nav_row.addWidget(dl_btn)
         nav_row.addWidget(lib_btn)
@@ -509,6 +576,7 @@ class AniAni(QWidget):
         prev_btn = QPushButton("⏮ Previous")
         prev_btn.clicked.connect(self._play_previous)
         self.pause_btn = QPushButton("⏸ Pause")
+        self.pause_btn.setObjectName("primary")
         self.pause_btn.clicked.connect(self._toggle_pause)
         next_btn = QPushButton("Next ⏭")
         next_btn.clicked.connect(self._play_next)
@@ -562,7 +630,7 @@ class AniAni(QWidget):
         self._link_worker.failed.connect(lambda e: self.now_status.setText(f"failed: {e}"))
         self._link_worker.start()
 
-        if self.source_name == "anidb" and self.skip_intro and shutil.which("ani-skip"):
+        if self.source_name == "anidb" and self.skip_intro and platform_utils.find_ani_skip():
             self._skip_worker = Worker(self._fetch_ani_skip_times, ep["ep_no"])
             self._skip_worker.done.connect(lambda t: setattr(self, "current_skip", t or {}))
             self._skip_worker.start()
@@ -575,7 +643,7 @@ class AniAni(QWidget):
             return {}
         canon = str(next((i for i, e in enumerate(self.episode_maps, 1) if e["ep_no"] == ep_no), 1))
         out = subprocess.run(
-            ["ani-skip", "-i", self.mal_id, "-e", canon],
+            [platform_utils.find_ani_skip() or "ani-skip", "-i", self.mal_id, "-e", canon],
             capture_output=True, text=True, timeout=8,
         ).stdout
         vals = {k: float(v) for k, v in re.findall(r"skip-(op_start|op_end|ed_start|ed_end)=([\d.]+)", out)}
@@ -756,6 +824,12 @@ def main():
     QGuiApplication.setDesktopFileName("aniani-gui")
     app = QApplication(sys.argv)
     app.setApplicationName("aniani-gui")
+    # Fusion is Qt's own cross-platform style -- popups (QComboBox's
+    # dropdown especially) are separate top-level windows that don't
+    # reliably pick up a QSS background under the native/Wayland-
+    # integrated style, and render transparent instead. Fusion renders
+    # everything through Qt itself, sidestepping that.
+    app.setStyle("Fusion")
     app.setStyleSheet(DARK_QSS)
     win = AniAni()
     win.show()

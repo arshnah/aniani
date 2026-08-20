@@ -1,0 +1,6 @@
+PyQt6
+requests
+httpx
+beautifulsoup4
+tqdm
+pypresence

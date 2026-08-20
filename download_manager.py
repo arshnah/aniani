@@ -9,7 +9,10 @@ import os
 import re
 import subprocess
 
-DOWNLOAD_ROOT = os.path.expanduser("~/Videos/aniani")
+import platform_utils
+
+DOWNLOAD_ROOT = platform_utils.downloads_dir("aniani")
+FFMPEG = platform_utils.find_ffmpeg() or "ffmpeg"
 
 
 def _safe(name):
@@ -61,7 +64,7 @@ class DownloadJob:
 def run_job(job, on_progress=None):
     """Blocking -- run this on a worker thread, not the GUI thread."""
     job.status = "downloading"
-    args = ["ffmpeg", "-y", "-loglevel", "error", "-stats"]
+    args = [FFMPEG, "-y", "-loglevel", "error", "-stats"]
     if job.referer:
         args += ["-headers", f"Referer: {job.referer}\r\n"]
     # anidb.app (and likely other sources) disguise HLS segment URLs with a

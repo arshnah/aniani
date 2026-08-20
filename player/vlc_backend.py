@@ -6,12 +6,17 @@ stream before building this.
 import os
 import secrets
 import subprocess
+import sys
 import time
 
 import requests
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import platform_utils  # noqa: E402
+
 HTTP_PORT = 9091
-PASSWORD_PATH = "/tmp/aniani-vlc-password"
+PASSWORD_PATH = platform_utils.temp_path("aniani-vlc-password")
+VLC_BIN = platform_utils.find_vlc() or "vlc"
 _PASSWORD = None  # cached per-process once read/generated
 
 
@@ -53,7 +58,7 @@ class VlcPlayer:
     def play(self, url, title=None, referer=None, start_seconds=None):
         self.stop()
         args = [
-            "vlc", "-I", "dummy", "--no-video-title-show",
+            VLC_BIN, "-I", "dummy", "--no-video-title-show",
             "--extraintf", "http", "--http-password", _password(), "--http-port", str(HTTP_PORT),
         ]
         if referer:

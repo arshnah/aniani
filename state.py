@@ -5,9 +5,9 @@ separate from ani-cli-discord-rpc's -- this is a different app.
 import json
 import os
 
-STATE_DIR = os.path.join(
-    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "aniani",
-)
+import platform_utils
+
+STATE_DIR = platform_utils.state_dir("aniani")
 HISTORY_PATH = os.path.join(STATE_DIR, "history.json")
 POSITIONS_PATH = os.path.join(STATE_DIR, "positions.json")
 LAST_SESSION_PATH = os.path.join(STATE_DIR, "last_session.json")

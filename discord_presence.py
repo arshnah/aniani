@@ -10,11 +10,11 @@ import time
 import requests
 from pypresence import Presence
 
+import platform_utils
+
 DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(DIR, "config.json")
-CACHE_PATH = os.path.join(
-    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "aniani", "cover_cache.json",
-)
+CACHE_PATH = os.path.join(platform_utils.state_dir("aniani"), "cover_cache.json")
 ANILIST_URL = "https://graphql.anilist.co"
 ANILIST_QUERY = """
 query ($search: String) {
