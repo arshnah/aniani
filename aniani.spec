@@ -21,7 +21,8 @@ a = Analysis(
     # would just be blank/missing in the frozen exe (font never bundled).
     datas=collect_data_files("qtawesome"),
     hiddenimports=[
-        "anidb_source", "yuma_source", "nyaa_source", "anilist_source", "_vendor_pyanimecli",
+        "anidb_source", "yuma_source", "nyaa_source", "anilist_source", "jikan_source",
+        "discovery_source", "_vendor_pyanimecli",
         "vlc_backend", "mpv_backend", "torrent_backend",
         "platform_utils", "discord_presence", "state", "download_manager", "rpc_daemon", "tracker", "image_cache",
     ],

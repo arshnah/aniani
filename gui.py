@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 import qtawesome as qta
+from PyQt6 import sip
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sources"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "player"))
@@ -39,7 +40,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pla
 import anidb_source
 import yuma_source
 import nyaa_source
-import anilist_source
+import discovery_source
 import vlc_backend
 import mpv_backend
 import torrent_backend
@@ -239,8 +240,8 @@ def _cover_bytes_for_title(title):
     """Continue-watching entries only have a title (from anidb.app/
     YumaAPI, neither of which hands back cover art) -- best-effort
     cross-reference against AniList by title search to get one anyway,
-    same fuzzy-match limitation as anilist_source.cover_for_title()."""
-    url = anilist_source.cover_for_title(title)
+    same fuzzy-match limitation as discovery_source.cover_for_title()."""
+    url = discovery_source.cover_for_title(title)
     if not url:
         return None
     return image_cache.fetch(url)
@@ -294,7 +295,16 @@ class ClickableWidget(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.pos()):
-            self.clicked.emit()
+            # NOT emitted synchronously here -- confirmed directly this
+            # was a real, reproducible crash (SIGABRT): the connected
+            # handler (_continue_selected -> _open_anime) switches pages
+            # and can end up tearing down/rebuilding this very card
+            # while it's still the widget actively processing this
+            # event, a classic Qt reentrancy hazard. Deferring to the
+            # next event-loop tick lets this handler fully unwind and
+            # return control to Qt first, same fix pattern used for
+            # exactly this class of bug in real Qt apps.
+            QTimer.singleShot(0, self.clicked.emit)
         super().mouseReleaseEvent(event)
 
 
@@ -706,13 +716,15 @@ class AniAni(QWidget):
         if self._recs_loaded:
             return
         self._recs_loaded = True
-        self._trending_worker = Worker(anilist_source.trending)
+        self._trending_worker = Worker(discovery_source.trending)
         self._trending_worker.done.connect(lambda r: self._set_card_row(self.trending_row_layout, r, self._search_title))
         self._trending_worker.done.connect(self._load_hero)
         self._trending_worker.start()
-        self._popular_worker = Worker(anilist_source.popular)
+        self._remember_worker(self._trending_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
+        self._popular_worker = Worker(discovery_source.popular)
         self._popular_worker.done.connect(lambda r: self._set_card_row(self.popular_row_layout, r, self._search_title))
         self._popular_worker.start()
+        self._remember_worker(self._popular_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
     def _build_card_row(self):
         """A QScrollArea with a container+layout created ONCE and reused
@@ -749,7 +761,7 @@ class AniAni(QWidget):
     def _set_card_row(self, layout, results, on_click):
         self._clear_row(layout)
         for r in results or []:
-            card = self._cover_card(r["title"], r.get("cover_large") or r.get("cover"), lambda _, t=r["title"]: on_click(t))
+            card = self._cover_card(r["title"], r.get("cover_large") or r.get("cover"), lambda t=r["title"]: on_click(t))
             layout.addWidget(card)
         if not results:
             empty = QLabel("nothing to show right now")
@@ -838,8 +850,7 @@ class AniAni(QWidget):
 
         worker.done.connect(finish)
         worker.start()
-        self._cover_workers = getattr(self, "_cover_workers", [])
-        self._cover_workers.append(worker)
+        self._remember_worker(worker)
         # real fetches consistently complete in 1-3s (confirmed
         # directly) -- 12s gave a genuinely stuck slot far too long
         # before freeing it back to the queue, which is exactly what
@@ -872,8 +883,36 @@ class AniAni(QWidget):
             url, on_done, retried = queue.pop(0)
             self._start_image_fetch(url, on_done, retried)
 
+    def _remember_worker(self, worker):
+        # self._cover_workers exists only to keep a live Python
+        # reference to each QThread so PyQt doesn't garbage-collect it
+        # mid-flight -- it was never pruned, so every image fetch across
+        # the app's whole lifetime (every dashboard load, every Browse
+        # tab visit, every Continue Watching refresh) piled up in this
+        # one list forever. Long enough sessions would accumulate
+        # hundreds of dead QThread objects, which is real, avoidable
+        # memory/resource pressure. Finished threads get dropped here
+        # instead of kept around for no reason.
+        self._cover_workers = [w for w in getattr(self, "_cover_workers", []) if not w.isFinished()]
+        self._cover_workers.append(worker)
+
     def _set_cover_icon(self, card, data):
         if not data:
+            return
+        # sip.isdeleted() checked BEFORE touching the widget, not just
+        # try/except RuntimeError afterward -- confirmed directly (real
+        # reproducible SIGABRT, not a Python-catchable exception):
+        # clicking a Continue Watching card whose cover fetch was still
+        # in flight could trigger _refresh_history() (via the already-
+        # downloaded-episode path) rebuilding the row -- deleting this
+        # very card -- while this cross-thread callback was still
+        # pending delivery. try/except only catches a RuntimeError Qt
+        # actually raises; a genuine race between "object mid-deletion"
+        # and "queued slot firing" can hit undefined C++-level behavior
+        # first. Checking isdeleted() up front avoids ever touching a
+        # widget that's known-gone instead of hoping for a clean
+        # exception if it isn't.
+        if sip.isdeleted(card) or sip.isdeleted(card.cover_label):
             return
         pix = QPixmap()
         if pix.loadFromData(data):
@@ -984,7 +1023,7 @@ class AniAni(QWidget):
             self._queue_image_fetch(cover, self._set_hero_pixmap)
 
     def _set_hero_pixmap(self, data):
-        if not data:
+        if not data or sip.isdeleted(self.hero_banner):  # see _set_cover_icon for why this is checked up front
             return
         pix = QPixmap()
         if not pix.loadFromData(data):
@@ -1044,14 +1083,13 @@ class AniAni(QWidget):
             resume_at = positions.get(state.position_key(e["source"], e["anime_title"], e["ep_no"]))
             if resume_at:
                 bits.append(f"resume {fmt_time(resume_at)}")
-            card = self._cover_card(e["anime_title"], None, lambda _, ent=e: self._continue_selected(ent))
+            card = self._cover_card(e["anime_title"], None, lambda ent=e: self._continue_selected(ent))
             card.setToolTip(f"{e['anime_title']}  ·  " + "  ·  ".join(bits))
             self.continue_row_layout.addWidget(card)
             worker = Worker(_cover_bytes_for_title, e["anime_title"])
             worker.done.connect(lambda data, b=card: self._set_cover_icon(b, data))
             worker.start()
-            self._cover_workers = getattr(self, "_cover_workers", [])
-            self._cover_workers.append(worker)
+            self._remember_worker(worker)
         if not entries:
             empty = QLabel("nothing in progress yet -- start watching something")
             empty.setObjectName("status")
@@ -1074,6 +1112,7 @@ class AniAni(QWidget):
             self._search_worker.done.connect(self._search_done)
         self._search_worker.failed.connect(lambda e: self.status.setText(f"search failed: {e}"))
         self._search_worker.start()
+        self._remember_worker(self._search_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
     def _search_done(self, results):
         self.status.setText(f"{len(results)} results" if results else "no results")
@@ -1166,7 +1205,7 @@ class AniAni(QWidget):
         self._queue_image_fetch(url, lambda data, lbl=label: self._set_cover_pixmap(lbl, data))
 
     def _set_cover_pixmap(self, label, data):
-        if not data:
+        if not data or sip.isdeleted(label):  # see _set_cover_icon for why this is checked up front
             return
         pix = QPixmap()
         if pix.loadFromData(data):
@@ -1227,11 +1266,12 @@ class AniAni(QWidget):
     def _load_browse(self):
         self.browse_list.clear()
         self.browse_status.setText("loading…")
-        fn = anilist_source.trending if self.browse_mode_combo.currentText() == "Trending" else anilist_source.popular
+        fn = discovery_source.trending if self.browse_mode_combo.currentText() == "Trending" else discovery_source.popular
         self._browse_worker = Worker(fn)
         self._browse_worker.done.connect(self._browse_loaded)
         self._browse_worker.failed.connect(lambda e: self.browse_status.setText(f"failed: {e}"))
         self._browse_worker.start()
+        self._remember_worker(self._browse_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
     def _browse_loaded(self, results):
         self.browse_status.setText(f"{len(results)} shows" if results else "no results (AniList may be down)")
@@ -1346,6 +1386,7 @@ class AniAni(QWidget):
         self._whoami_worker.done.connect(self._anilist_connected)
         self._whoami_worker.failed.connect(lambda e: self.anilist_status.setText(f"failed: {e}"))
         self._whoami_worker.start()
+        self._remember_worker(self._whoami_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
     def _anilist_connected(self, username):
         if username:
@@ -1371,6 +1412,7 @@ class AniAni(QWidget):
         self._whoami_worker.done.connect(self._anilist_connected)
         self._whoami_worker.failed.connect(lambda e: self.anilist_status.setText(f"failed: {e}"))
         self._whoami_worker.start()
+        self._remember_worker(self._whoami_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
     # ---------- episode list ----------
 
@@ -1417,6 +1459,7 @@ class AniAni(QWidget):
         self._ep_worker.done.connect(lambda eps: self._episodes_loaded(eps, jump_to_ep, reattach))
         self._ep_worker.failed.connect(lambda e: self.ep_status.setText(f"failed: {e}"))
         self._ep_worker.start()
+        self._remember_worker(self._ep_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
     def _episodes_loaded(self, eps, jump_to_ep, reattach=False):
         self.episode_maps = eps
@@ -1874,11 +1917,13 @@ class AniAni(QWidget):
         self._link_worker.done.connect(self._got_stream)
         self._link_worker.failed.connect(lambda e: self.now_status.setText(f"failed: {e}"))
         self._link_worker.start()
+        self._remember_worker(self._link_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
         if self.source_name == "anidb" and self.skip_intro and platform_utils.find_ani_skip():
             self._skip_worker = Worker(self._fetch_ani_skip_times, ep["ep_no"])
             self._skip_worker.done.connect(lambda t: setattr(self, "current_skip", t or {}))
             self._skip_worker.start()
+            self._remember_worker(self._skip_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
     def _play_downloaded_episode(self, ep_no):
         path = download_manager.dest_path(self.anime_title, ep_no)
@@ -1899,7 +1944,18 @@ class AniAni(QWidget):
         self.now_status.setText("playing (downloaded)" + (f" (resuming from {int(resume_at)}s)" if resume_at else ""))
         state.update_history(self.source_name, self.anime_id, self.anime_title, ep_no)
         state.save_last_session(self.source_name, self.anime_id, self.anime_title, ep_no)
-        self._refresh_history()
+        # deferred, not called directly -- confirmed directly (real,
+        # reproducible SIGABRT): this whole chain can originate from
+        # clicking a Continue Watching card, and _refresh_history()
+        # destroys/rebuilds that exact row, i.e. it can destroy the very
+        # card whose click triggered this call. Qt's own C++ event
+        # dispatch for that original click can still be unwinding at
+        # this point even though the Python call stack looks fully
+        # returned -- deferring to a clean, later event-loop tick avoids
+        # destroying a widget while Qt itself may still be mid-event on
+        # it, which a Python-level try/except can't reliably catch
+        # since it isn't a Python exception.
+        QTimer.singleShot(0, self._refresh_history)
         self._update_presence()
 
     def _fetch_ani_skip_times(self, ep_no):
@@ -1953,7 +2009,7 @@ class AniAni(QWidget):
         self.now_status.setText("playing" + (f" (resuming from {int(resume_at)}s)" if resume_at else ""))
         state.update_history(self.source_name, self.anime_id, self.anime_title, self.current_ep_no)
         state.save_last_session(self.source_name, self.anime_id, self.anime_title, self.current_ep_no)
-        self._refresh_history()
+        QTimer.singleShot(0, self._refresh_history)  # see _play_downloaded_episode for why this is deferred
         self._update_presence()
 
     def _play_torrent(self, release, download_fully):
@@ -1968,6 +2024,7 @@ class AniAni(QWidget):
         self._torrent_worker.done.connect(self._torrent_ready)
         self._torrent_worker.failed.connect(lambda e: self.now_status.setText(f"failed: {e}"))
         self._torrent_worker.start()
+        self._remember_worker(self._torrent_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
     def _start_torrent(self, release, download_fully):
         if not self.torrent_engine.ensure_running():
@@ -2079,6 +2136,7 @@ class AniAni(QWidget):
         self._synced_this_ep = True
         self._sync_worker = Worker(tracker.update_progress, self.anime_title, self.current_ep_no)
         self._sync_worker.start()
+        self._remember_worker(self._sync_worker)  # avoid GC'ing a still-running QThread (real fatal crash otherwise)
 
     def _toggle_pause(self):
         self.player.toggle_pause()
