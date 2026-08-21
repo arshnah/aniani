@@ -780,33 +780,86 @@ class AniAni(QWidget):
 
         card.clicked.connect(on_click)
         if cover_url:
-            self._load_cover_into_button(card, cover_url)
+            self._queue_image_fetch(cover_url, lambda data, c=card: self._set_cover_icon(c, data))
         return card
 
-    def _load_cover_into_button(self, card, url, _retried=False):
-        # a cache hit is just a local disk read (image_cache.fetch()
-        # already checks disk before ever touching the network) --
-        # routing it through a background QThread anyway means every
-        # card still shows its placeholder icon for a beat before
-        # popping in, even when nothing was actually downloaded. Try a
-        # synchronous cache read first so cache hits render instantly;
-        # only fall back to a worker thread for an actual network fetch.
+    # loading the dashboard fires 50+ cover requests at once (25 trending
+    # + 25 recommended, each on its own QThread) -- several would just
+    # never resolve, staying on the placeholder icon forever, even with
+    # a retry (reported directly via screenshot, and confirmed: a plain
+    # curl to AniList's CDN is fast, but firing dozens of concurrent
+    # `requests` connections at once left some hanging/failing outright,
+    # and an immediate retry just re-entered the same congestion). A
+    # shared cap on concurrent fetches -- queuing the rest instead of
+    # firing them all at once -- fixes the actual cause instead of
+    # papering over it with more retries.
+    MAX_CONCURRENT_IMAGE_FETCHES = 6
+
+    def _queue_image_fetch(self, url, on_done, _retried=False):
+        """on_done(bytes_or_None) fires once the fetch (or its one retry
+        on failure) resolves. A cache hit resolves synchronously,
+        immediately, no queueing needed."""
         cached = image_cache.cached_bytes(url)
         if cached is not None:
-            self._set_cover_icon(card, cached)
+            on_done(cached)
             return
+        self._image_fetch_queue = getattr(self, "_image_fetch_queue", [])
+        self._image_fetch_active = getattr(self, "_image_fetch_active", 0)
+        if self._image_fetch_active >= self.MAX_CONCURRENT_IMAGE_FETCHES:
+            self._image_fetch_queue.append((url, on_done, _retried))
+            return
+        self._start_image_fetch(url, on_done, _retried)
+
+    def _start_image_fetch(self, url, on_done, _retried):
+        self._image_fetch_active = getattr(self, "_image_fetch_active", 0) + 1
         worker = Worker(image_cache.fetch, url)
-        # a transient network hiccup left a couple of cards stuck on the
-        # placeholder icon forever with no way to recover (reported
-        # directly via screenshot) -- one retry covers exactly that
-        # without turning a real, persistent failure into a retry loop.
-        worker.done.connect(
-            lambda data, c=card: self._load_cover_into_button(c, url, True) if not data and not _retried
-            else self._set_cover_icon(c, data)
-        )
+        # a stuck worker permanently holds its concurrency slot and jams
+        # the entire queue behind it -- confirmed directly: active count
+        # stuck at the cap with items still queued, 15+ seconds later,
+        # well past image_cache.fetch()'s own 8s per-request timeout.
+        # Whatever the exact cause (thread-level hang, not just a slow
+        # request), a real fetch always resolves in well under this, so
+        # anything still pending past it gets treated as failed instead
+        # of blocking every other card behind it forever. `handled`
+        # guards against both the real completion and the watchdog
+        # firing for the same fetch.
+        handled = {"done": False}
+
+        def finish(data):
+            if handled["done"]:
+                return
+            handled["done"] = True
+            self._on_image_fetch_done(url, on_done, data, _retried)
+
+        worker.done.connect(finish)
         worker.start()
         self._cover_workers = getattr(self, "_cover_workers", [])
         self._cover_workers.append(worker)
+        QTimer.singleShot(12000, lambda: finish(None))
+
+    def _on_image_fetch_done(self, url, on_done, data, _retried):
+        self._image_fetch_active = max(0, getattr(self, "_image_fetch_active", 1) - 1)
+        if not data and not _retried:
+            # append to the BACK of the queue rather than starting the
+            # retry immediately -- starting it right here re-occupies
+            # the very slot that just freed up before anything else
+            # waiting gets a turn. Confirmed directly: several fetches
+            # that kept failing (each hitting the watchdog below) kept
+            # re-claiming their own freed slot via instant retry, so the
+            # active count oscillated at the cap forever and the real
+            # queue never advanced at all. A retry is just another
+            # normal queue entry now -- one FIFO, no cutting in line.
+            self._image_fetch_queue = getattr(self, "_image_fetch_queue", [])
+            self._image_fetch_queue.append((url, on_done, True))
+        else:
+            on_done(data)
+        self._advance_image_fetch_queue()
+
+    def _advance_image_fetch_queue(self):
+        queue = getattr(self, "_image_fetch_queue", [])
+        while queue and getattr(self, "_image_fetch_active", 0) < self.MAX_CONCURRENT_IMAGE_FETCHES:
+            url, on_done, retried = queue.pop(0)
+            self._start_image_fetch(url, on_done, retried)
 
     def _set_cover_icon(self, card, data):
         if not data:
@@ -917,11 +970,7 @@ class AniAni(QWidget):
         self.hero_btn.clicked.connect(lambda: self._search_title(top["title"]))
         cover = top.get("banner") or top.get("cover_xl") or top.get("cover_large") or top.get("cover")
         if cover:
-            worker = Worker(image_cache.fetch, cover)
-            worker.done.connect(lambda data: self._set_hero_pixmap(data))
-            worker.start()
-            self._cover_workers = getattr(self, "_cover_workers", [])
-            self._cover_workers.append(worker)
+            self._queue_image_fetch(cover, self._set_hero_pixmap)
 
     def _set_hero_pixmap(self, data):
         if not data:
@@ -1103,11 +1152,7 @@ class AniAni(QWidget):
         return row, cover
 
     def _load_cover(self, label, url):
-        worker = Worker(image_cache.fetch, url)
-        worker.done.connect(lambda data, lbl=label: self._set_cover_pixmap(lbl, data))
-        worker.start()
-        self._cover_workers = getattr(self, "_cover_workers", [])
-        self._cover_workers.append(worker)
+        self._queue_image_fetch(url, lambda data, lbl=label: self._set_cover_pixmap(lbl, data))
 
     def _set_cover_pixmap(self, label, data):
         if not data:
