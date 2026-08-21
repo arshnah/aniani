@@ -482,9 +482,10 @@ class AniAni(QWidget):
         v.setContentsMargins(0, 18, 0, 14)
         v.setSpacing(6)
 
-        logo = QLabel("A")
+        logo = QLabel()
         logo.setObjectName("logoMark")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setPixmap(qta.icon("fa5s.play", color=MOCHA["crust"]).pixmap(QSize(18, 18)))
         v.addWidget(logo, alignment=Qt.AlignmentFlag.AlignHCenter)
         v.addSpacing(14)
 
