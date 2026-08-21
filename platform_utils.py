@@ -17,6 +17,31 @@ import tempfile
 WINDOWS = sys.platform == "win32"
 MACOS = sys.platform == "darwin"
 
+# Every network call across the app (AniList, anidb.app, cover-art
+# downloads, Discord's own AniList lookups) goes through `requests`,
+# which -- via urllib3 -- tries every address getaddrinfo() returns in
+# order, IPv6 first. On a network where IPv6 is present in DNS but
+# actually broken/blackholed, that means EVERY request stalls for the
+# full connect timeout on the dead IPv6 address before falling back to
+# IPv4 -- confirmed directly: a plain curl to AniList took 0.8s, the
+# exact same request through `requests` took 9-16s, and forcing IPv4-
+# only resolution brought it back to under 1s. This patches urllib3's
+# address-family selection once, globally, for every module that
+# imports platform_utils (which is effectively all of them) -- wrapped
+# in a try/except since it reaches into a private urllib3 module that
+# could change shape in a future version, and this is a pure
+# performance optimization, never worth a hard crash over.
+try:
+    import socket
+    import urllib3.util.connection as _urllib3_conn
+
+    def _prefer_ipv4(*args, **kwargs):
+        return socket.AF_INET
+
+    _urllib3_conn.allowed_gai_family = _prefer_ipv4
+except ImportError:
+    pass
+
 
 def state_dir(app_name):
     """Per-user persistent state (history, positions, config cache)."""
