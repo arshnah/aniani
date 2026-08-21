@@ -1,0 +1,8 @@
+PyQt6
+qtawesome
+requests
+httpx
+beautifulsoup4
+tqdm
+pypresence
+rich
