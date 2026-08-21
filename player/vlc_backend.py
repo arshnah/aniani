@@ -181,18 +181,23 @@ class VlcPlayer:
     def stop(self):
         # VLC under -I dummy doesn't always exit cleanly on SIGTERM,
         # especially mid-stream (network I/O cleanup can hang) --
-        # reported directly: it lingers as a process after Stop/close.
-        # Escalate to SIGKILL if it doesn't exit promptly instead of
-        # leaving a zombie.
+        # reported directly: it lingers as a process after Stop/close,
+        # audio still audible the whole time. The position is always
+        # saved to disk before stop() is ever called (see
+        # gui.py's _save_position() call sites), so there's nothing
+        # left to lose by not giving SIGTERM much time to work -- a
+        # short grace period, then straight to SIGKILL, instead of the
+        # up-to-4s worst case (2s here + 2s after kill) this used to
+        # allow while VLC hung mid-cleanup with audio still playing.
         if self.proc is not None:
             if self.is_running():
                 self.proc.terminate()
                 try:
-                    self.proc.wait(timeout=2)
+                    self.proc.wait(timeout=0.3)
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
                     try:
-                        self.proc.wait(timeout=2)
+                        self.proc.wait(timeout=0.3)
                     except subprocess.TimeoutExpired:
                         pass
             self.proc = None
@@ -204,7 +209,7 @@ class VlcPlayer:
             # done by hand with a plain poll loop instead of
             # subprocess.Popen.wait().
             platform_utils.kill_pid(self._shared_pid)
-            for _ in range(20):  # ~2s, matching the Popen path's timeout
+            for _ in range(3):  # ~0.3s, matching the Popen path's grace period
                 time.sleep(0.1)
                 try:
                     os.kill(self._shared_pid, 0)
