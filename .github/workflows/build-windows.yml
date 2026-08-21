@@ -1,0 +1,77 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # softprops/action-gh-release needs this to create the release; default token grants read-only
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build aniani.exe
+        run: pyinstaller --clean --noconfirm aniani.spec
+
+      - name: Verify the exe was actually produced
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\aniani.exe")) {
+            Write-Error "dist\aniani.exe was not produced by the build"
+            exit 1
+          }
+          Get-Item "dist\aniani.exe" | Format-List Name, Length
+
+      - name: Smoke test -- actually launch it and confirm it doesn't crash
+        shell: pwsh
+        run: |
+          # console=False in the spec means no window to read output from
+          # if it crashes -- redirect stdout/stderr to files so a failure
+          # here is actually diagnosable instead of just "exit code 1".
+          $proc = Start-Process -FilePath "dist\aniani.exe" -PassThru `
+            -RedirectStandardOutput "smoke-stdout.log" -RedirectStandardError "smoke-stderr.log"
+          Start-Sleep -Seconds 8
+          if ($proc.HasExited) {
+            Write-Host "---- stdout ----"
+            Get-Content "smoke-stdout.log" -ErrorAction SilentlyContinue
+            Write-Host "---- stderr ----"
+            Get-Content "smoke-stderr.log" -ErrorAction SilentlyContinue
+            Write-Error "aniani.exe exited on its own within 8s (exit code $($proc.ExitCode)) -- treating as a crash"
+            exit 1
+          }
+          Write-Host "aniani.exe is still running after 8s, looks alive"
+          Stop-Process -Id $proc.Id -Force
+
+      - name: Upload smoke test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-logs
+          path: smoke-std*.log
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aniani-windows
+          path: dist/aniani.exe
+          retention-days: 30
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/aniani.exe
