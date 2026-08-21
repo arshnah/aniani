@@ -787,19 +787,23 @@ class AniAni(QWidget):
     # loading the dashboard fires 50+ cover requests at once (25 trending
     # + 25 recommended, each on its own QThread) -- several would just
     # never resolve, staying on the placeholder icon forever, even with
-    # a retry (reported directly via screenshot, and confirmed: a plain
-    # curl to AniList's CDN is fast, but firing dozens of concurrent
-    # `requests` connections at once left some hanging/failing outright,
-    # and an immediate retry just re-entered the same congestion). A
-    # shared cap on concurrent fetches -- queuing the rest instead of
-    # firing them all at once -- fixes the actual cause instead of
-    # papering over it with more retries.
-    MAX_CONCURRENT_IMAGE_FETCHES = 6
+    # a retry (reported directly via screenshot). Isolated testing (15
+    # raw QThreads hitting the same real URLs) completed in under 4s
+    # with zero failures, so the network/CDN itself isn't the limit --
+    # confirmed directly that the same URLs stall specifically when
+    # competing inside this app's full thread load (dozens of Workers:
+    # metadata fetches, continue-watching covers, the poll timer's own
+    # subprocess calls, etc. all running at once). 6 concurrent slots
+    # was too conservative for what the network can actually sustain,
+    # which meant a lot of waiting on a cap that wasn't the bottleneck.
+    MAX_CONCURRENT_IMAGE_FETCHES = 12
 
-    def _queue_image_fetch(self, url, on_done, _retried=False):
-        """on_done(bytes_or_None) fires once the fetch (or its one retry
-        on failure) resolves. A cache hit resolves synchronously,
-        immediately, no queueing needed."""
+    MAX_IMAGE_FETCH_RETRIES = 2
+
+    def _queue_image_fetch(self, url, on_done, retry_count=0):
+        """on_done(bytes_or_None) fires once the fetch (or its retries,
+        up to MAX_IMAGE_FETCH_RETRIES) resolves. A cache hit resolves
+        synchronously, immediately, no queueing needed."""
         cached = image_cache.cached_bytes(url)
         if cached is not None:
             on_done(cached)
@@ -807,11 +811,11 @@ class AniAni(QWidget):
         self._image_fetch_queue = getattr(self, "_image_fetch_queue", [])
         self._image_fetch_active = getattr(self, "_image_fetch_active", 0)
         if self._image_fetch_active >= self.MAX_CONCURRENT_IMAGE_FETCHES:
-            self._image_fetch_queue.append((url, on_done, _retried))
+            self._image_fetch_queue.append((url, on_done, retry_count))
             return
-        self._start_image_fetch(url, on_done, _retried)
+        self._start_image_fetch(url, on_done, retry_count)
 
-    def _start_image_fetch(self, url, on_done, _retried):
+    def _start_image_fetch(self, url, on_done, retry_count):
         self._image_fetch_active = getattr(self, "_image_fetch_active", 0) + 1
         worker = Worker(image_cache.fetch, url)
         # a stuck worker permanently holds its concurrency slot and jams
@@ -830,28 +834,34 @@ class AniAni(QWidget):
             if handled["done"]:
                 return
             handled["done"] = True
-            self._on_image_fetch_done(url, on_done, data, _retried)
+            self._on_image_fetch_done(url, on_done, data, retry_count)
 
         worker.done.connect(finish)
         worker.start()
         self._cover_workers = getattr(self, "_cover_workers", [])
         self._cover_workers.append(worker)
-        QTimer.singleShot(12000, lambda: finish(None))
+        # real fetches consistently complete in 1-3s (confirmed
+        # directly) -- 12s gave a genuinely stuck slot far too long
+        # before freeing it back to the queue, which is exactly what
+        # was starving the rest of the dashboard's covers.
+        QTimer.singleShot(5000, lambda: finish(None))
 
-    def _on_image_fetch_done(self, url, on_done, data, _retried):
+    def _on_image_fetch_done(self, url, on_done, data, retry_count):
         self._image_fetch_active = max(0, getattr(self, "_image_fetch_active", 1) - 1)
-        if not data and not _retried:
-            # append to the BACK of the queue rather than starting the
-            # retry immediately -- starting it right here re-occupies
-            # the very slot that just freed up before anything else
-            # waiting gets a turn. Confirmed directly: several fetches
-            # that kept failing (each hitting the watchdog below) kept
-            # re-claiming their own freed slot via instant retry, so the
-            # active count oscillated at the cap forever and the real
-            # queue never advanced at all. A retry is just another
-            # normal queue entry now -- one FIFO, no cutting in line.
+        if not data and retry_count < self.MAX_IMAGE_FETCH_RETRIES:
+            # confirmed directly: the same URLs that fail inside this
+            # app's full thread load succeed instantly in isolation, so
+            # a failure here reads as transient contention, not a real
+            # dead link -- worth more than one retry. The first retry
+            # goes straight to the back of the queue (fair FIFO, doesn't
+            # re-claim the slot that just freed); the second gets an
+            # actual delay first, giving whatever caused the contention
+            # more time to clear rather than landing in the same window.
             self._image_fetch_queue = getattr(self, "_image_fetch_queue", [])
-            self._image_fetch_queue.append((url, on_done, True))
+            if retry_count == 0:
+                self._image_fetch_queue.append((url, on_done, retry_count + 1))
+            else:
+                QTimer.singleShot(3000, lambda: self._queue_image_fetch(url, on_done, retry_count + 1))
         else:
             on_done(data)
         self._advance_image_fetch_queue()
