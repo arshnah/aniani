@@ -47,7 +47,7 @@ def fetch(url):
         return None
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(path, "wb") as f:
+        with open(_cache_path(url), "wb") as f:
             f.write(data)
     except OSError:
         pass
