@@ -28,7 +28,7 @@ from PyQt6.QtGui import QGuiApplication, QPixmap, QIcon, QColor, QPainter
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QStackedWidget, QCheckBox,
-    QSlider, QComboBox, QProgressBar, QFrame, QToolButton, QScrollArea,
+    QSlider, QComboBox, QProgressBar, QFrame, QScrollArea,
     QMessageBox,
 )
 import qtawesome as qta
@@ -100,13 +100,14 @@ QWidget#coverThumb {{ background: {MOCHA["surface0"]}; border-radius: 8px; }}
    dozens on screen at once in the dashboard rows) added visual noise
    without adding information. The border only earns its keep as a
    hover accent, same as a real lift/elevation would. */
-QToolButton#coverCard {{
+QWidget#coverCard {{
     background: {MOCHA["mantle"]}; border: 1px solid transparent; border-radius: 12px;
-    padding: 6px; color: {MOCHA["subtext1"]}; font-size: 11.5px; font-weight: 600;
 }}
-QToolButton#coverCard:hover {{
-    background: {MOCHA["surface0"]}; border-color: {MOCHA["pink"]}; color: {MOCHA["rosewater"]};
+QWidget#coverCard:hover {{
+    background: {MOCHA["surface0"]}; border-color: {MOCHA["pink"]};
 }}
+QLabel#cardTitle {{ color: {MOCHA["subtext1"]}; }}
+QWidget#coverCard:hover QLabel#cardTitle {{ color: {MOCHA["rosewater"]}; }}
 QFrame#divider {{ background: {MOCHA["surface0"]}; border: none; margin: 4px 0 8px 0; }}
 
 QWidget#heroCard {{ background: transparent; }}
@@ -279,6 +280,22 @@ def spawn_rpc_daemon(backend_name):
             f.write(str(proc.pid))
     except OSError:
         pass
+
+
+class ClickableWidget(QWidget):
+    """A plain QWidget with a clicked signal -- used for dashboard cover
+    cards instead of QToolButton, since QToolButton's built-in text
+    label doesn't support real word-wrap: it silently elides to one
+    line, which on top of this app's own manual title truncation
+    produced garbled double-truncated text like "The Exile...w to
+    Gam..." (confirmed directly via screenshot). A real child QLabel
+    with setWordWrap(True) wraps properly across 2-3 lines instead."""
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.pos()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
 
 class Worker(QThread):
@@ -740,20 +757,33 @@ class AniAni(QWidget):
         layout.addStretch()
 
     def _cover_card(self, title, cover_url, on_click):
-        btn = QToolButton()
-        btn.setObjectName("coverCard")
-        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        btn.setIconSize(QSize(120, 162))
-        btn.setFixedSize(138, 220)
-        btn.setIcon(self._icons["film"])
-        btn.setText(title if len(title) <= 42 else title[:40] + "…")
-        btn.setToolTip(title)
-        btn.clicked.connect(on_click)
-        if cover_url:
-            self._load_cover_into_button(btn, cover_url)
-        return btn
+        card = ClickableWidget()
+        card.setObjectName("coverCard")
+        card.setFixedSize(138, 224)
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card.setToolTip(title)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(6)
 
-    def _load_cover_into_button(self, btn, url):
+        cover = QLabel()
+        cover.setFixedSize(126, 162)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cover.setPixmap(self._icons["film"].pixmap(QSize(64, 64)))
+        v.addWidget(cover)
+        card.cover_label = cover  # _set_cover_icon needs this back
+
+        text = QLabel(_truncate(title, 80))
+        text.setObjectName("cardTitle")
+        text.setWordWrap(True)
+        v.addWidget(text, 1)
+
+        card.clicked.connect(on_click)
+        if cover_url:
+            self._load_cover_into_button(card, cover_url)
+        return card
+
+    def _load_cover_into_button(self, card, url, _retried=False):
         # a cache hit is just a local disk read (image_cache.fetch()
         # already checks disk before ever touching the network) --
         # routing it through a background QThread anyway means every
@@ -763,21 +793,32 @@ class AniAni(QWidget):
         # only fall back to a worker thread for an actual network fetch.
         cached = image_cache.cached_bytes(url)
         if cached is not None:
-            self._set_cover_icon(btn, cached)
+            self._set_cover_icon(card, cached)
             return
         worker = Worker(image_cache.fetch, url)
-        worker.done.connect(lambda data, b=btn: self._set_cover_icon(b, data))
+        # a transient network hiccup left a couple of cards stuck on the
+        # placeholder icon forever with no way to recover (reported
+        # directly via screenshot) -- one retry covers exactly that
+        # without turning a real, persistent failure into a retry loop.
+        worker.done.connect(
+            lambda data, c=card: self._load_cover_into_button(c, url, True) if not data and not _retried
+            else self._set_cover_icon(c, data)
+        )
         worker.start()
         self._cover_workers = getattr(self, "_cover_workers", [])
         self._cover_workers.append(worker)
 
-    def _set_cover_icon(self, btn, data):
+    def _set_cover_icon(self, card, data):
         if not data:
             return
         pix = QPixmap()
         if pix.loadFromData(data):
             try:
-                btn.setIcon(QIcon(pix))
+                card.cover_label.setPixmap(pix.scaled(
+                    card.cover_label.width(), card.cover_label.height(),
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                ))
             except RuntimeError:
                 pass  # row was rebuilt (e.g. Continue Watching refreshed) before this fetch landed
 
