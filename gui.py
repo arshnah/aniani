@@ -761,7 +761,7 @@ class AniAni(QWidget):
     def _set_card_row(self, layout, results, on_click):
         self._clear_row(layout)
         for r in results or []:
-            card = self._cover_card(r["title"], r.get("cover_large") or r.get("cover"), lambda t=r["title"]: on_click(t))
+            card = self._cover_card(r["title"], r.get("cover_xl") or r.get("cover_large") or r.get("cover"), lambda t=r["title"]: on_click(t))
             layout.addWidget(card)
         if not results:
             empty = QLabel("nothing to show right now")
@@ -849,6 +849,7 @@ class AniAni(QWidget):
             self._on_image_fetch_done(url, on_done, data, retry_count)
 
         worker.done.connect(finish)
+        worker.failed.connect(lambda e: finish(None))
         worker.start()
         self._remember_worker(worker)
         # real fetches consistently complete in 1-3s (confirmed
