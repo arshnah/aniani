@@ -446,7 +446,12 @@ class AniAni(QWidget):
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_player)
-        self.poll_timer.start(1000)
+        # 500ms, not 1000ms -- this is what notices VLC's window being
+        # closed via SUPER+Q (see window_gone() below) and stops the
+        # process; a full second of poll lag on top of stop()'s own
+        # grace period was adding up to a noticeably laggy close with
+        # audio still audible (reported directly).
+        self.poll_timer.start(500)
 
         self.rpc_timer = QTimer(self)
         self.rpc_timer.timeout.connect(self._update_presence)
