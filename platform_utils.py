@@ -152,6 +152,31 @@ def popen_detached(args, **kwargs):
     return subprocess.Popen(args, start_new_session=True, **kwargs)
 
 
+def pid_alive(pid):
+    """True if a process with this pid is currently running. Linux/macOS:
+    os.kill(pid, 0) is a standard no-op existence probe. Windows doesn't
+    support signal 0 the same way (os.kill there is limited to
+    CTR_C_EVENT/CTRL_BREAK_EVENT/SIGTERM and raises for anything else
+    regardless of whether the pid exists), so it needs OpenProcess
+    instead -- used by the RPC presence watchdog to notice the GUI
+    process died by any means (crash, force-kill, a WM keybind that
+    doesn't deliver a catchable signal) so it can clear stale Discord
+    presence left behind."""
+    if WINDOWS:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def kill_pid(pid):
     """Best-effort terminate by PID, used to clean up a lingering RPC
     daemon from a previous run. os.kill(pid, SIGTERM) already maps to
