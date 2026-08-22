@@ -55,6 +55,7 @@ import webbrowser
 DIR = os.path.dirname(os.path.abspath(__file__))
 DAEMON_PID_PATH = platform_utils.temp_path("aniani-rpc-daemon.pid")
 DAEMON_LOG_PATH = platform_utils.temp_path("aniani-rpc-daemon.log")
+WATCHDOG_LOG_PATH = platform_utils.temp_path("aniani-rpc-watchdog.log")
 
 SOURCES = {"anidb": anidb_source, "yuma": yuma_source}
 
@@ -279,6 +280,30 @@ def spawn_rpc_daemon(backend_name):
             proc = platform_utils.popen_detached(args, stdout=log, stderr=subprocess.STDOUT)
         with open(DAEMON_PID_PATH, "w") as f:
             f.write(str(proc.pid))
+    except OSError:
+        pass
+
+
+def spawn_presence_watchdog():
+    # closeEvent()/the SIGTERM handler cover a normal or SIGTERM'd exit,
+    # but some window managers route their close keybind through
+    # something that kills the process without delivering anything
+    # catchable at all (confirmed directly: a custom Hyprland Lua
+    # keybind left Discord showing a permanently stale "Browsing
+    # aniani" with nothing left alive to clear it). This watches the
+    # GUI's own pid from a separate process and clears presence itself
+    # the moment it's gone, regardless of how it died -- started once
+    # at GUI launch, not on close, since by definition it has to
+    # outlive whatever kills the GUI.
+    try:
+        if getattr(sys, "frozen", False):
+            args = [sys.executable, "--rpc-daemon", "--watchdog",
+                     "--gui-pid", str(os.getpid()), "--daemon-pid-path", DAEMON_PID_PATH]
+        else:
+            args = [sys.executable, os.path.join(DIR, "gui.py"), "--rpc-daemon", "--watchdog",
+                     "--gui-pid", str(os.getpid()), "--daemon-pid-path", DAEMON_PID_PATH]
+        with open(WATCHDOG_LOG_PATH, "w") as log:
+            platform_utils.popen_detached(args, stdout=log, stderr=subprocess.STDOUT)
     except OSError:
         pass
 
@@ -2332,12 +2357,18 @@ def main():
     win = AniAni()
     win.show()
 
+    # covers any close path that doesn't deliver anything catchable at
+    # all (a hard crash, Task Manager's End Task, a WM keybind that
+    # skips a graceful close) -- cross-platform via platform_utils.pid_alive.
+    spawn_presence_watchdog()
+
     if not platform_utils.WINDOWS:
         # safety net for when Hyprland's killactive (SUPER+Q) kills the
         # process directly instead of sending a graceful close request --
         # closeEvent() doesn't fire in that case, so the RPC daemon
         # handoff would just silently never happen. SIGTERM can still be
-        # caught even then; SIGKILL can't be, but killactive uses TERM.
+        # caught even then; SIGKILL can't be -- the watchdog above is
+        # the actual backstop for that case.
         def _on_sigterm(signum, frame):
             win._cleanup_on_exit()
             app.quit()

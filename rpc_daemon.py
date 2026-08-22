@@ -14,16 +14,56 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "player"))
 
 import discord_presence
+import platform_utils
 import state
 import vlc_backend
 import mpv_backend
 
 
+def watchdog_main(gui_pid, daemon_pid_path, poll):
+    # closeEvent()/the SIGTERM handler are the normal cleanup path, but
+    # they only run if the GUI process gets a chance to react at all --
+    # confirmed directly that some window-close paths (a custom Hyprland
+    # keybind routed through a Lua dispatcher, not the plain killactive
+    # SIGTERM this app otherwise handles fine) kill the process without
+    # delivering anything catchable, leaving Discord's presence panel
+    # stuck showing "Browsing aniani" forever with nothing left alive to
+    # clear it. This process doesn't depend on the GUI cooperating at
+    # all -- it just watches the pid from the outside and cleans up
+    # once it's gone, whatever killed it.
+    print(f"[rpc_daemon] watchdog started, watching gui pid={gui_pid}", flush=True)
+    while platform_utils.pid_alive(gui_pid):
+        time.sleep(poll)
+    print("[rpc_daemon] watchdog: gui pid gone", flush=True)
+    # give a clean shutdown's own disconnect (and a real playing-video
+    # handoff spawning the real daemon above) a moment to land first --
+    # only step in if neither happened.
+    time.sleep(1.5)
+    if os.path.exists(daemon_pid_path):
+        try:
+            with open(daemon_pid_path) as f:
+                if platform_utils.pid_alive(int(f.read().strip())):
+                    print("[rpc_daemon] watchdog: a real handoff daemon is already running -- nothing to do", flush=True)
+                    return
+        except (OSError, ValueError):
+            pass
+    presence = discord_presence.DiscordPresence()
+    presence.disconnect()
+    print("[rpc_daemon] watchdog: cleared stale presence", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=["vlc", "mpv"], required=True)
+    parser.add_argument("--backend", choices=["vlc", "mpv"])
     parser.add_argument("--poll", type=float, default=5.0)
+    parser.add_argument("--watchdog", action="store_true")
+    parser.add_argument("--gui-pid", type=int)
+    parser.add_argument("--daemon-pid-path")
     args = parser.parse_args()
+
+    if args.watchdog:
+        watchdog_main(args.gui_pid, args.daemon_pid_path, args.poll)
+        return
 
     player = vlc_backend.VlcPlayer() if args.backend == "vlc" else mpv_backend.MpvPlayer()
     if args.backend == "mpv":
