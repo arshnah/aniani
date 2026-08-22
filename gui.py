@@ -490,7 +490,6 @@ class AniAni(QWidget):
         kill_lingering_rpc_daemon()
         self._refresh_history()
         self._update_presence()
-        self._restore_last_session()
         # _on_page_changed (which normally triggers this) is wired to
         # QStackedWidget.currentChanged -- a signal that only fires on an
         # actual *change*, so it never fires for Home since Home is
@@ -500,17 +499,6 @@ class AniAni(QWidget):
         # indefinitely, not just slow).
         if not self._compact_mode:
             self._load_dashboard_recommendations()
-
-    def _restore_last_session(self):
-        last = state.load_last_session()
-        if not last or not last.get("anime_id"):
-            return
-        self.source_name = last.get("source", "anidb")
-        alive = self.player.is_running() if hasattr(self.player, "is_running") else False
-        if not alive:
-            status = self.player.get_status() if hasattr(self.player, "get_status") else None
-            alive = status is not None
-        self._open_anime(last["anime_id"], last["anime_title"], jump_to_ep=last["ep_no"], reattach=alive)
 
     # ---------- sidebar nav ----------
 
