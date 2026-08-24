@@ -22,3 +22,8 @@ edit an existing AniList list from inside the app yet, sync is one-way
 (local watch -> anilist) only.
 
 compact/floating-panel mode (the original's sidebar toggle) not ported.
+
+skip-intro/outro not ported at all. the python version had two paths:
+anidb source used ani-skip (an external mal-id lookup binary), yuma's
+own watch() response carried intro/outro timestamps directly. neither
+is wired up here, no skip button, no auto-skip, nothing.
