@@ -1,0 +1,24 @@
+windows support: started, unverified. ipc.rs now has a windows named-pipe
+backend (open the pipe as a file, background reader thread into a channel,
+same trick the original python app used) instead of the unix-only
+UnixStream path, and platform.rs has vlc/mpv/qbittorrent windows fallback
+install paths. none of this has actually been built or run on windows,
+no windows rust target or toolchain available to cross-check with. needs
+a real windows machine to compile and test against a real mpv/vlc install
+before trusting it.
+
+yuma (aniwatchtv.to) stream resolution: search() and episodes() work,
+watch() is unimplemented. needs the client-key fetch + cryptojs-aes
+decrypt pipeline the megacloud embed uses, see yuma.rs for why that
+wasn't just ported over inline.
+
+resume-from-timestamp UI (seek bar), volume/speed controls, subtitle/audio
+track cycling: backend methods exist on player::Backend already
+(seek/set_volume/set_speed/cycle_subtitle/cycle_audio on MpvPlayer), not
+wired into the GUI yet.
+
+anilist tracker: whoami/connect/sync-toggle wired, but no way to browse or
+edit an existing AniList list from inside the app yet, sync is one-way
+(local watch -> anilist) only.
+
+compact/floating-panel mode (the original's sidebar toggle) not ported.
