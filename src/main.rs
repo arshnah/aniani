@@ -72,6 +72,7 @@ struct App {
 
     downloads: Vec<Arc<download::DownloadJob>>,
     downloaded_library: Arc<Mutex<Vec<download::DownloadedShow>>>,
+    seek_drag: Option<f64>,
 }
 
 impl App {
@@ -108,6 +109,7 @@ impl App {
             pending_torrent_playback: Arc::new(Mutex::new(None)),
             downloads: vec![],
             downloaded_library: Arc::new(Mutex::new(vec![])),
+            seek_drag: None,
         };
         app.refresh_discover();
         app.refresh_anilist_username();
@@ -234,6 +236,18 @@ impl App {
         if let Some(link) = Self::resolve_link(sel, ep_ref) {
             self.player.play(&link.url, &title, ep_no, link.referer, resume_at, source_name, &sel.id);
             self.fetch_discord_cover(&title);
+            self.player.set_skip_times(None, None);
+
+            if matches!(sel.source, StreamSource::AniDb) {
+                let anime_id = sel.id.clone();
+                let canonical = sel.episodes.lock().unwrap().iter().position(|e| e.ep_no == ep_no).map(|i| i as i64 + 1).unwrap_or(1);
+                let player = self.player.clone();
+                std::thread::spawn(move || {
+                    let Ok(Some(mal_id)) = sources::anidb_mal_id(&anime_id) else { return };
+                    let Ok(times) = sources::ani_skip_times(&mal_id, canonical) else { return };
+                    player.set_skip_times(times.op, times.ed);
+                });
+            }
 
             if self.prefs.anilist_sync {
                 let client = self.http.clone();
@@ -491,13 +505,44 @@ impl eframe::App for App {
                     ui.label(format!("{show} · episode {ep}"));
                     let status = self.player.status.lock().unwrap().clone();
                     if let Some(status) = &status {
-                        ui.label(format!("{:.0}s / {:.0}s", status.time, status.duration));
                         if ui.button(if status.paused { "▶" } else { "⏸" }).clicked() {
                             self.player.toggle_pause();
                         }
+                        let mut pos = self.seek_drag.unwrap_or(status.time);
+                        let slider = ui.add(
+                            egui::Slider::new(&mut pos, 0.0..=status.duration.max(1.0))
+                                .show_value(false)
+                                .custom_formatter(|_, _| String::new()),
+                        );
+                        if slider.dragged() {
+                            self.seek_drag = Some(pos);
+                        }
+                        if slider.drag_stopped() {
+                            self.player.seek(pos);
+                            self.seek_drag = None;
+                        }
+                        ui.label(format!("{:.0}s / {:.0}s", status.time, status.duration));
                     }
                     if ui.button("stop").clicked() {
                         self.player.stop();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("vol");
+                    if ui.add(egui::Slider::new(&mut self.prefs.volume, 0..=150).show_value(true)).changed() {
+                        self.player.set_volume(self.prefs.volume);
+                    }
+                    ui.label("speed");
+                    if ui.add(egui::Slider::new(&mut self.prefs.speed, 0.5..=2.0).show_value(true)).changed() {
+                        self.player.set_speed(self.prefs.speed);
+                    }
+                    if self.prefs.player == "mpv" {
+                        if ui.button("sub").clicked() {
+                            self.player.cycle_subtitle();
+                        }
+                        if ui.button("audio").clicked() {
+                            self.player.cycle_audio();
+                        }
                     }
                 });
             });
@@ -687,7 +732,7 @@ impl eframe::App for App {
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         state::save_prefs(&self.prefs);
     }
 }

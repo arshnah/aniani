@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.29"
+eframe = { version = "0.29", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "accesskit"] }
 egui = "0.29"
 egui_extras = { version = "0.29", features = ["all_loaders"] }
 image = { version = "0.25", features = ["png", "jpeg"] }

@@ -325,6 +325,16 @@ impl Backend {
             Backend::Vlc(p) => p.set_speed(rate),
         }
     }
+    pub fn cycle_subtitle(&mut self) {
+        if let Backend::Mpv(p) = self {
+            p.cycle_subtitle();
+        }
+    }
+    pub fn cycle_audio(&mut self) {
+        if let Backend::Mpv(p) = self {
+            p.cycle_audio();
+        }
+    }
     pub fn stop(&mut self) {
         match self {
             Backend::Mpv(p) => p.stop(),

@@ -79,6 +79,10 @@ pub fn find_qbittorrent() -> Option<String> {
     find_binary(&["qbittorrent-nox", "qbittorrent-nox.exe", "qbittorrent.exe"])
 }
 
+pub fn find_ani_skip() -> Option<String> {
+    find_binary(&["ani-skip", "ani-skip.exe"])
+}
+
 pub fn debug_log(msg: &str) {
     use std::io::Write;
     let path = state_dir("aniani").join("debug.log");

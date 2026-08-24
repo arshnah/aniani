@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,8 +11,15 @@ pub enum Cmd {
     Stop,
     SetBackend(String),
     Browsing(String),
+    Seek(f64),
+    SetVolume(i32),
+    SetSpeed(f64),
+    CycleSubtitle,
+    CycleAudio,
+    SetSkipTimes(Option<(f64, f64)>, Option<(f64, f64)>),
 }
 
+#[derive(Clone)]
 pub struct PlayerHandle {
     tx: Sender<Cmd>,
     pub status: Arc<Mutex<Option<player::Status>>>,
@@ -35,6 +42,9 @@ impl PlayerHandle {
                 player::Backend::Mpv(player::MpvPlayer::new())
             };
             let mut discord = discord::DiscordPresence::new();
+            let mut skip_op: Option<(f64, f64)> = None;
+            let mut skip_ed: Option<(f64, f64)> = None;
+            let mut skipped: HashSet<&'static str> = HashSet::new();
 
             loop {
                 match rx.recv_timeout(Duration::from_millis(800)) {
@@ -42,6 +52,9 @@ impl PlayerHandle {
                         backend.play(&url, Some(&title), referer.as_deref(), start);
                         *thread_now_playing.lock().unwrap() = Some((title.clone(), ep_no.clone()));
                         state::update_history(&source, &anime_id, &title, &ep_no);
+                        skip_op = None;
+                        skip_ed = None;
+                        skipped.clear();
                     }
                     Ok(Cmd::TogglePause) => backend.toggle_pause(),
                     Ok(Cmd::Stop) => {
@@ -59,6 +72,16 @@ impl PlayerHandle {
                         };
                     }
                     Ok(Cmd::Browsing(detail)) => discord.browsing(&detail),
+                    Ok(Cmd::Seek(seconds)) => backend.seek(seconds),
+                    Ok(Cmd::SetVolume(percent)) => backend.set_volume(percent),
+                    Ok(Cmd::SetSpeed(rate)) => backend.set_speed(rate),
+                    Ok(Cmd::CycleSubtitle) => backend.cycle_subtitle(),
+                    Ok(Cmd::CycleAudio) => backend.cycle_audio(),
+                    Ok(Cmd::SetSkipTimes(op, ed)) => {
+                        skip_op = op;
+                        skip_ed = ed;
+                        skipped.clear();
+                    }
                     Err(_) => {}
                 }
 
@@ -81,6 +104,18 @@ impl PlayerHandle {
                         let ms = t0.elapsed().as_secs_f64() * 1000.0;
                         if ms > 200.0 {
                             platform::debug_log(&format!("worker: discord.watching() took {ms:.0}ms"));
+                        }
+
+                        for (name, seg) in [("op", skip_op), ("ed", skip_ed)] {
+                            if skipped.contains(name) {
+                                continue;
+                            }
+                            if let Some((start, end)) = seg {
+                                if status.time >= start && status.time < end {
+                                    backend.seek(end);
+                                    skipped.insert(name);
+                                }
+                            }
                         }
 
                         let key = state::position_key("anidb", show, ep);
@@ -125,5 +160,29 @@ impl PlayerHandle {
 
     pub fn browsing(&self, detail: &str) {
         let _ = self.tx.send(Cmd::Browsing(detail.to_string()));
+    }
+
+    pub fn seek(&self, seconds: f64) {
+        let _ = self.tx.send(Cmd::Seek(seconds));
+    }
+
+    pub fn set_volume(&self, percent: i32) {
+        let _ = self.tx.send(Cmd::SetVolume(percent));
+    }
+
+    pub fn set_speed(&self, rate: f64) {
+        let _ = self.tx.send(Cmd::SetSpeed(rate));
+    }
+
+    pub fn cycle_subtitle(&self) {
+        let _ = self.tx.send(Cmd::CycleSubtitle);
+    }
+
+    pub fn cycle_audio(&self) {
+        let _ = self.tx.send(Cmd::CycleAudio);
+    }
+
+    pub fn set_skip_times(&self, op: Option<(f64, f64)>, ed: Option<(f64, f64)>) {
+        let _ = self.tx.send(Cmd::SetSkipTimes(op, ed));
     }
 }

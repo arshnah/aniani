@@ -318,6 +318,39 @@ pub fn anidb_episodes(anime_id: &str) -> anyhow::Result<Vec<Episode>> {
         .collect())
 }
 
+pub fn anidb_mal_id(anime_id: &str) -> anyhow::Result<Option<String>> {
+    let page = curl_impersonate(&format!("{ANIDB_BASE}/anime/{anime_id}"))?;
+    let re = regex::Regex::new(r"https://myanimelist\.net/anime/(\d+)/")?;
+    Ok(re.captures(&page).map(|c| c[1].to_string()))
+}
+
+pub struct SkipTimes {
+    pub op: Option<(f64, f64)>,
+    pub ed: Option<(f64, f64)>,
+}
+
+pub fn ani_skip_times(mal_id: &str, canonical_episode: i64) -> anyhow::Result<SkipTimes> {
+    let bin = crate::platform::find_ani_skip().unwrap_or_else(|| "ani-skip".to_string());
+    let out = std::process::Command::new(bin)
+        .args(["-i", mal_id, "-e", &canonical_episode.to_string()])
+        .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let re = regex::Regex::new(r"skip-(op_start|op_end|ed_start|ed_end)=([\d.]+)")?;
+    let mut vals = std::collections::HashMap::new();
+    for cap in re.captures_iter(&stdout) {
+        vals.insert(cap[1].to_string(), cap[2].parse::<f64>().unwrap_or(0.0));
+    }
+    let op = match (vals.get("op_start"), vals.get("op_end")) {
+        (Some(&s), Some(&e)) => Some((s, e)),
+        _ => None,
+    };
+    let ed = match (vals.get("ed_start"), vals.get("ed_end")) {
+        (Some(&s), Some(&e)) => Some((s, e)),
+        _ => None,
+    };
+    Ok(SkipTimes { op, ed })
+}
+
 pub fn anidb_watch(ep_ref: &str, dub: bool) -> anyhow::Result<Option<WatchLink>> {
     let lang = if dub { "eng" } else { "jpn" };
     let page = curl_impersonate(&format!("{ANIDB_BASE}/api/frontend/episode/{ep_ref}/languages"))?;
