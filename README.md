@@ -1,145 +1,116 @@
 # aniani
 
 A desktop GUI for searching, watching, and downloading anime -- a
-Netflix-style Discover dashboard (hero banner, Continue Watching /
-Trending / Recommended cover-art rows) → episode list → play, with
-resume-from-timestamp, skip-intro/outro, AniList tracker sync, and
-always-on Discord Rich Presence. Styled in Catppuccin Mocha with a
-pink/mauve accent pair. Defaults to a real 1280x800 window; a sidebar
-toggle switches to a compact 420x680 floating-panel mode that strips
-the dashboard back down to just search + results.
+discover dashboard (Continue Watching / Trending / Popular cover-art
+rows, click one to jump to search) → episode list → play, with
+resume-from-timestamp, AniList tracker sync, and Discord Rich
+Presence. Rust, egui/eframe, real slate-and-amber theme (not a
+copy of the old Python version's Catppuccin Mocha look).
 
-## Playback controls
+This is a full rewrite, not a port. The old Python/PyQt6 version is
+still on the `main` branch if you want it; this branch replaces it
+going forward.
 
-Playback speed (0.5x-2x) and, on mpv, subtitle/audio track cycling --
-VLC's HTTP interface only exposes id-based track *set* commands with no
-way to list what's available, so track cycling is mpv-only (the button
-hides itself when VLC is the active backend). Keyboard shortcuts while
-the player page is focused: `Space` pause, `←`/`→` seek 10s, `↑`/`↓`
-volume, `[`/`]` speed.
+## Why the rewrite
 
-## Browse / discover
-
-A "Browse" tab pulls trending and popular anime straight from
-AniList's public GraphQL API (no account/API key needed) -- selecting a
-title searches it on whichever source is currently active.
-
-## AniList tracker sync
-
-Optional, off by default. When enabled (Account tab), finishing an
-episode pushes your progress to your AniList list -- so aniani doesn't
-become a second, disconnected watch-history silo from whatever you
-already track on. One-time setup:
-
-1. Create a free client at
-   [anilist.co/settings/developer](https://anilist.co/settings/developer)
-   with redirect URL `https://anilist.co/api/v2/oauth/pin`.
-2. Paste that client id into the Account tab and click "Open AniList
-   authorization page" -- authorize in your browser, AniList shows a
-   token as plain text.
-3. Paste that token back into the Account tab and hit Connect.
-
-No local webserver or redirect handler needed -- this is the same
-token-via-copy-paste flow other unofficial AniList desktop clients use.
-Anime titles are matched to AniList entries by title search (best
-effort, same limitation any client without a shared cross-reference id
-has); episode numbers that aren't a plain integer (specials, etc.) are
-skipped rather than guessed at.
-
-## Windows, no Python needed
-
-Grab `aniani.exe` from the [Releases page](../../releases) -- built
-automatically by GitHub Actions, no installation, nothing else to set
-up. Discord Rich Presence works out of the box (no Discord Developer
-account needed, it uses aniani's own shared app id). You'll still want
-**VLC** (recommended) or **mpv** installed for actual playback, and
-optionally **ffmpeg** for downloads -- aniani will tell you clearly if
-one's missing rather than failing silently.
+The Python version's dashboard has to decode 25+ anime cover jpegs
+just to render the Discover tab, and that decode cost adds up fast in
+an interpreted language. Going systems-mode: Rust for this, Go/Zig
+staying in rotation for whatever else needs them. Confirmed the actual
+perf gap before writing that as a claim: the same egui code, unoptimized
+debug build vs. release build, showed multi-second slow-frame stalls
+on startup in debug and zero in release -- compiled-and-optimized is
+the part python can never do for cpu-bound work like image decode.
 
 ## Sources
 
-- **anidb.app** (default) -- scraped directly, no login, generally
-  reachable.
-- **YumaAPI / aniwatchtv.to** -- vendored from
-  [pyanimecli](https://github.com/gammadevv/pyanimecli) (MIT, see
-  `LICENSE_PYANIMECLI`). Blocked by some ISPs (confirmed: India, via both
-  DNS poisoning and SNI-level filtering) -- works fine off that network.
-- **nyaa.si** (torrent) -- different flow: search returns torrent
-  releases, not a clean episode list. Streams via sequential download
-  (qbittorrent-nox) once enough has buffered, or downloads fully for
+- **anidb.app** (default) -- scraped directly, needs `curl_chrome136`
+  (curl-impersonate) on PATH since anidb rejects plain curl's TLS
+  fingerprint with a 403.
+- **aniwatchtv.to (yuma)** -- search and episode listing work, scraped
+  directly. Stream resolution is **not implemented**: the site's embed
+  needs a per-request client key plus a CryptoJS-AES decrypt of the
+  sources payload, both of which shift whenever the site's own JS
+  changes. Reimplementing a moving-target crypto scheme from scratch
+  wasn't worth faking; genuinely unimplemented, not a stub pretending
+  to work. Tracked in `TODO.txt`.
+- **nyaa.si** (torrent) -- RSS search, no scraping, no anti-bot.
+  Streams via sequential download through qbittorrent-nox once enough
+  has buffered (first/last-piece priority), or downloads fully for
   offline viewing.
 
 ## Players
 
-- **VLC** (default) -- driven over its HTTP control interface.
-- **mpv** -- driven over its JSON IPC socket.
+- **mpv** -- driven over its JSON IPC socket (Unix domain socket on
+  Linux/macOS, named pipe on Windows).
+- **VLC** -- driven over its HTTP control interface, fresh random port
+  and password every launch so a stale leftover VLC process can never
+  get silently polled instead of the current one.
 
-Either way, playback is a **real, separate player window**, not embedded
-in the Qt panel -- embedding was tried two ways (X11 `--wid` reparenting,
-libmpv's OpenGL render API) and abandoned: reparenting doesn't actually
-work on wlroots/Hyprland even through XWayland, and the render API
-crashed (SIGABRT) on first paint. The panel spawns/drives/closes the
-player over IPC/HTTP instead.
+Switchable from the top bar at any time.
 
 ## Downloads / offline
 
-Download a single episode, a range, or a whole series via ffmpeg (same
-approach `ani-cli` itself uses for `-d`/`--download`). Downloaded
-episodes show up in the in-app Offline Library, playable with no source
-or network needed at all.
+ffmpeg remuxes HLS to mp4 (same approach `ani-cli` itself uses for
+`-d`/`--download`), progress parsed off ffmpeg's own stderr,
+cancellable. A Downloads tab shows in-progress jobs and a browsable
+library of what's already saved, playable with no source or network
+needed at all.
+
+## AniList tracker sync
+
+Optional, off by default. When enabled, finishing an episode pushes
+your progress to your AniList list. One-time setup: create a free
+client at
+[anilist.co/settings/developer](https://anilist.co/settings/developer)
+with redirect URL `https://anilist.co/api/v2/oauth/pin`, paste the
+client id in, open the authorize page, paste the token back. No local
+webserver or redirect handler needed. Currently one-way (local watch
+pushes to AniList, no pulling an existing list).
 
 ## Discord Rich Presence
 
-Always on -- shows "Browsing" while searching/picking an episode, and
-the full watching state (cover art, elapsed time) during playback. While
-the panel is open it updates presence itself; closing it hands off to a
-standalone daemon (`rpc_daemon.py`) that keeps polling the player and
-updating Discord while it plays on its own, so presence doesn't drop
-just because you closed the control panel. Reopening the panel kills
-that daemon and takes back over.
+Shows "Browsing aniani" on launch and while picking something, then
+the full watching state (cover art, elapsed time, a "View on AniList"
+button) during playback. Same shared Discord application id the
+Python version used, works with zero setup.
+
+## Continue watching
+
+Built from local watch history, covers fetched from Jikan first (MAL's
+own image CDN) with an AniList GraphQL fallback if Jikan's having one
+of its documented outages. Clicking a continue-watching card checks if
+that episode is already downloaded and plays it straight from disk if
+so, instead of re-resolving a live stream.
 
 ## Setup
 
-Needs `curl_chrome136` (curl-impersonate, for anidb.app), `vlc` and/or
-`mpv`, `qbittorrent-nox` (for the nyaa.si source), `ani-skip` (optional,
-for anidb.app's skip-intro), and the Python deps in `requirements.txt`
-(`pip install -r requirements.txt`).
+Needs `curl_chrome136` (curl-impersonate, for anidb.app), `mpv` and/or
+`vlc`, `qbittorrent-nox` (for the nyaa.si source), and `ffmpeg` (for
+downloads) on PATH.
 
-Create a Discord Application at
-<https://discord.com/developers/applications> and write its client ID to
-`config.json`:
-
-```json
-{ "client_id": "..." }
 ```
-
-Want AniList progress sync too? That's a separate one-time setup covered
-in its own section above ("AniList tracker sync") -- it's optional and
-off by default, so nothing here breaks if you skip it.
+cargo build --release
+```
 
 ## Platform support
 
-**Windows support hasn't been run on an actual Windows machine yet.**
-Treat it as "should work, needs real testing," and file/fix issues as
-they turn up.
+Built and daily-driven on Linux (Arch/Hyprland). Windows support
+exists in the source -- `platform.rs` has the Windows state/download
+dirs, mpv named-pipe IPC, and vlc/mpv/qbittorrent install-path
+fallbacks -- but **hasn't actually been compiled or run on Windows by
+hand yet**, only through this repo's own GitHub Actions Windows
+runner. Treat it as "should build, needs a real Windows machine to
+actually trust." `qbittorrent-nox` has no Windows build, falls back to
+the regular qBittorrent GUI (same WebUI API, just shows a window).
 
-Built and daily-driven on Linux (Arch/Hyprland). Windows support exists
--- every OS-specific decision (state/download directories, mpv IPC via
-a named pipe instead of a Unix socket, binary discovery for
-vlc/mpv/ffmpeg/curl-impersonate/ani-skip/qbittorrent, detached-process
-spawning for the RPC daemon handoff) is centralized in
-`platform_utils.py` and follows documented Windows conventions
-(`%LOCALAPPDATA%`, `\\.\pipe\...`, `DETACHED_PROCESS`). A couple of
-things are known-different there rather than broken:
+macOS: untested, not a current target. The `dirs`-crate-based paths
+and the Unix-socket mpv IPC path should carry over as-is; VLC/mpv
+binary discovery would need `/Applications` fallbacks added.
 
-- `qbittorrent-nox` has no official Windows build; falls back to the
-  regular qBittorrent GUI, which shows a window (same WebUI API
-  underneath, just not headless).
-- `curl-impersonate` (`curl_chrome136`) needs a separate Windows binary
-  on PATH -- it doesn't ship with Windows the way plain `curl.exe` does
-  since 10 1803.
+## What's left
 
-macOS: untested and not a current target, though most of the same
-`platform_utils.py` groundwork (state dirs, Unix-socket mpv IPC) should
-carry over -- binary discovery paths for vlc/mpv would need macOS
-`/Applications` fallbacks added if anyone wants to pick that up.
+See `TODO.txt` -- yuma stream resolution, resume-seek-bar/volume/speed
+controls in the UI (backend methods exist, not wired to a widget),
+two-way AniList sync, the compact/floating-panel mode the Python
+version had.
