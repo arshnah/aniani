@@ -44,6 +44,24 @@ mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus) {
   SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status) { id }
 }
 "#;
+const MY_LIST_QUERY: &str = r#"
+query ($userId: Int, $statuses: [MediaListStatus]) {
+  MediaListCollection(userId: $userId, type: ANIME, status_in: $statuses) {
+    lists {
+      entries {
+        progress
+        status
+        media {
+          id
+          episodes
+          title { romaji english }
+          coverImage { large }
+        }
+      }
+    }
+  }
+}
+"#;
 
 #[derive(Deserialize)]
 struct Envelope {
@@ -71,6 +89,11 @@ pub async fn whoami(client: &reqwest::Client) -> Option<String> {
     data.get("Viewer")?.get("name")?.as_str().map(|s| s.to_string())
 }
 
+pub async fn viewer_id(client: &reqwest::Client) -> Option<i64> {
+    let data = query(client, WHOAMI_QUERY, json!({})).await?;
+    data.get("Viewer")?.get("id")?.as_i64()
+}
+
 pub struct MediaRef {
     pub id: i64,
     pub episodes: Option<i64>,
@@ -83,6 +106,56 @@ pub async fn find_media(client: &reqwest::Client, title: &str) -> Option<MediaRe
         id: media.get("id")?.as_i64()?,
         episodes: media.get("episodes").and_then(|v| v.as_i64()),
     })
+}
+
+#[derive(Clone)]
+pub struct ListEntry {
+    pub title: String,
+    pub progress: i64,
+    pub episodes: Option<i64>,
+    pub status: String,
+    pub cover: Option<String>,
+}
+
+pub async fn my_list(client: &reqwest::Client) -> Vec<ListEntry> {
+    let Some(user_id) = viewer_id(client).await else { return vec![] };
+    let Some(data) = query(
+        client,
+        MY_LIST_QUERY,
+        json!({"userId": user_id, "statuses": ["CURRENT", "REPEATING"]}),
+    )
+    .await
+    else {
+        return vec![];
+    };
+
+    let mut out = vec![];
+    let lists = data
+        .get("MediaListCollection")
+        .and_then(|c| c.get("lists"))
+        .and_then(|l| l.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for list in lists {
+        let entries = list.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+        for entry in entries {
+            let media = entry.get("media");
+            let title = media
+                .and_then(|m| m.get("title"))
+                .and_then(|t| t.get("english").or_else(|| t.get("romaji")))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let Some(title) = title else { continue };
+            out.push(ListEntry {
+                title,
+                progress: entry.get("progress").and_then(|v| v.as_i64()).unwrap_or(0),
+                episodes: media.and_then(|m| m.get("episodes")).and_then(|v| v.as_i64()),
+                status: entry.get("status").and_then(|v| v.as_str()).unwrap_or("CURRENT").to_string(),
+                cover: media.and_then(|m| m.get("coverImage")).and_then(|c| c.get("large")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+            });
+        }
+    }
+    out
 }
 
 pub async fn update_progress(client: &reqwest::Client, anime_title: &str, ep_no: &str) {

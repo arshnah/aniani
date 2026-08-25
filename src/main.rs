@@ -68,6 +68,7 @@ struct App {
     anilist_username: Arc<Mutex<Option<String>>>,
     anilist_client_id_input: String,
     anilist_pin_input: String,
+    anilist_list: Arc<Mutex<Vec<tracker::ListEntry>>>,
 
     media_cache: Arc<Mutex<HashMap<String, discord::MediaInfo>>>,
     pending_torrent_playback: Arc<Mutex<Option<(std::path::PathBuf, String)>>>,
@@ -107,6 +108,7 @@ impl App {
             anilist_username: Arc::new(Mutex::new(None)),
             anilist_client_id_input: String::new(),
             anilist_pin_input: String::new(),
+            anilist_list: Arc::new(Mutex::new(vec![])),
             media_cache,
             pending_torrent_playback: Arc::new(Mutex::new(None)),
             downloads: vec![],
@@ -115,6 +117,7 @@ impl App {
         };
         app.refresh_discover();
         app.refresh_anilist_username();
+        app.refresh_anilist_list();
         app.refresh_downloaded_library();
         app.refresh_continue_watching();
         app.player.browsing("idle");
@@ -151,6 +154,15 @@ impl App {
         self.rt.spawn(async move {
             let name = tracker::whoami(&client).await;
             *out.lock().unwrap() = name;
+        });
+    }
+
+    fn refresh_anilist_list(&self) {
+        let client = self.http.clone();
+        let out = self.anilist_list.clone();
+        self.rt.spawn(async move {
+            let list = tracker::my_list(&client).await;
+            *out.lock().unwrap() = list;
         });
     }
 
@@ -477,11 +489,25 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("aniani");
-                ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Discover, "discover");
-                ui.selectable_value(&mut self.tab, Tab::Search, "search");
-                ui.selectable_value(&mut self.tab, Tab::Downloads, "downloads");
+                if !self.prefs.compact_mode {
+                    ui.separator();
+                    ui.selectable_value(&mut self.tab, Tab::Discover, "discover");
+                    ui.selectable_value(&mut self.tab, Tab::Search, "search");
+                    ui.selectable_value(&mut self.tab, Tab::Downloads, "downloads");
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(if self.prefs.compact_mode { "⛶" } else { "▭" })
+                        .on_hover_text(if self.prefs.compact_mode { "expand" } else { "compact mode" })
+                        .clicked()
+                    {
+                        self.prefs.compact_mode = !self.prefs.compact_mode;
+                        let size = if self.prefs.compact_mode { egui::vec2(420.0, 680.0) } else { egui::vec2(1280.0, 800.0) };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                        if self.prefs.compact_mode {
+                            self.tab = Tab::Search;
+                        }
+                    }
                     egui::ComboBox::from_id_salt("player_backend")
                         .selected_text(&self.prefs.player)
                         .show_ui(ui, |ui| {
@@ -589,6 +615,30 @@ impl eframe::App for App {
                     if ui.button("disconnect").clicked() {
                         tracker::clear_token();
                         *self.anilist_username.lock().unwrap() = None;
+                        self.anilist_list.lock().unwrap().clear();
+                    }
+                    let anilist_list = self.anilist_list.lock().unwrap().clone();
+                    if !anilist_list.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label("watching, from your AniList list:");
+                        let as_anime: Vec<sources::Anime> = anilist_list
+                            .iter()
+                            .map(|e| sources::Anime {
+                                title: e.title.clone(),
+                                episodes: e.episodes,
+                                score: None,
+                                status: Some(e.status.clone()),
+                                genres: vec![],
+                                description: match e.episodes {
+                                    Some(total) => format!("episode {} of {total} on AniList", e.progress),
+                                    None => format!("episode {} on AniList", e.progress),
+                                },
+                                cover: e.cover.clone(),
+                            })
+                            .collect();
+                        if let Some(title) = self.anime_grid(ui, "anilist_list", &as_anime) {
+                            self.open_in_search(&title);
+                        }
                     }
                 } else {
                     ui.label("paste your AniList client id, open the authorize link, then paste the token back:");
@@ -603,6 +653,7 @@ impl eframe::App for App {
                         if ui.button("connect").clicked() && !self.anilist_pin_input.is_empty() {
                             tracker::save_token(&self.anilist_pin_input);
                             self.refresh_anilist_username();
+                            self.refresh_anilist_list();
                         }
                     });
                 }
