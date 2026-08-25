@@ -93,9 +93,18 @@ pub fn debug_log(msg: &str) {
 }
 
 pub fn find_curl_impersonate() -> Option<String> {
-    find_binary(&[
-        "curl_chrome136",
-        "curl_chrome136.exe",
-        "curl-impersonate-chrome.exe",
-    ])
+    let names = ["curl_chrome136", "curl_chrome136.exe", "curl-impersonate-chrome.exe"];
+    if let Some(found) = find_binary(&names) {
+        return Some(found);
+    }
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    if let Some(dir) = exe_dir {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
 }

@@ -25,8 +25,19 @@ the part python can never do for cpu-bound work like image decode.
 ## Sources
 
 - **anidb.app** (default) -- scraped directly, needs `curl_chrome136`
-  (curl-impersonate) on PATH since anidb rejects plain curl's TLS
-  fingerprint with a 403.
+  (curl-impersonate) since anidb rejects plain curl's TLS fingerprint
+  with a 403. Checked for on PATH first, then next to the aniani
+  binary itself -- so dropping `curl_chrome136`/`curl_chrome136.exe`
+  in the same folder as `aniani`/`aniani.exe` works with no PATH setup.
+  There's no official prebuilt Windows binary for this; the closest
+  thing is [yuzd/curl-impersonate-win](https://github.com/yuzd/curl-impersonate-win),
+  which needs building from source via MSYS2 (a `build.bat` script,
+  no ready-made `.exe`). On Linux/macOS the upstream
+  [lwthiker/curl-impersonate](https://github.com/lwthiker/curl-impersonate)
+  releases page has real prebuilt binaries. Without it, anidb search
+  just fails silently in the UI right now (logged to
+  `debug.log` as `anidb_search(...) failed: ...`) -- yuma and nyaa
+  don't need it and work regardless.
 - **aniwatchtv.to (yuma)** -- search and episode listing work, scraped
   directly. Stream resolution is **not implemented**: the site's embed
   needs a per-request client key plus a CryptoJS-AES decrypt of the
