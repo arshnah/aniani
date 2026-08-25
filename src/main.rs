@@ -22,6 +22,8 @@ enum Tab {
     Discover,
     Search,
     Downloads,
+    History,
+    Settings,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -76,6 +78,12 @@ struct App {
     downloads: Vec<Arc<download::DownloadJob>>,
     downloaded_library: Arc<Mutex<Vec<download::DownloadedShow>>>,
     seek_drag: Option<f64>,
+    update_available: Arc<Mutex<Option<String>>>,
+    anime_detail: Option<sources::Anime>,
+    selected_episodes: std::collections::HashSet<String>,
+    discover_genre: Option<String>,
+    discover_sort: String,
+    filtered_results: Arc<Mutex<Vec<sources::Anime>>>,
 }
 
 impl App {
@@ -114,14 +122,45 @@ impl App {
             downloads: vec![],
             downloaded_library: Arc::new(Mutex::new(vec![])),
             seek_drag: None,
+            update_available: Arc::new(Mutex::new(None)),
+            anime_detail: None,
+            selected_episodes: std::collections::HashSet::new(),
+            discover_genre: None,
+            discover_sort: "TRENDING_DESC".to_string(),
+            filtered_results: Arc::new(Mutex::new(vec![])),
         };
         app.refresh_discover();
         app.refresh_anilist_username();
         app.refresh_anilist_list();
         app.refresh_downloaded_library();
         app.refresh_continue_watching();
+        app.check_for_update();
         app.player.browsing("idle");
         app
+    }
+
+    fn refresh_filtered(&self) {
+        let client = self.http.clone();
+        let out = self.filtered_results.clone();
+        let sort = self.discover_sort.clone();
+        let genre = self.discover_genre.clone();
+        self.rt.spawn(async move {
+            if let Ok(v) = sources::discover_filtered(&client, &sort, genre.as_deref()).await {
+                *out.lock().unwrap() = v;
+            }
+        });
+    }
+
+    fn check_for_update(&self) {
+        let client = self.http.clone();
+        let out = self.update_available.clone();
+        self.rt.spawn(async move {
+            if let Some(latest) = sources::latest_release_tag(&client).await {
+                if sources::is_newer_version(&latest, env!("CARGO_PKG_VERSION")) {
+                    *out.lock().unwrap() = Some(latest);
+                }
+            }
+        });
     }
 
     fn refresh_downloaded_library(&self) {
@@ -198,6 +237,7 @@ impl App {
     }
 
     fn select_anime(&mut self, id: &str, title: &str, source: StreamSource) {
+        self.selected_episodes.clear();
         let episodes = Arc::new(Mutex::new(vec![]));
         self.selected = Some(SelectedAnime {
             title: title.to_string(),
@@ -327,7 +367,7 @@ impl App {
         }
     }
 
-    fn anime_grid(&self, ui: &mut egui::Ui, id_salt: &str, list: &[sources::Anime]) -> Option<String> {
+    fn anime_grid(&self, ui: &mut egui::Ui, id_salt: &str, list: &[sources::Anime]) -> Option<sources::Anime> {
         let mut clicked = None;
         egui::ScrollArea::horizontal().id_salt(id_salt).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -365,7 +405,7 @@ impl App {
                         anime.description.clone()
                     });
                     if resp.clicked() {
-                        clicked = Some(anime.title.clone());
+                        clicked = Some(anime.clone());
                     }
                 }
             });
@@ -486,6 +526,35 @@ impl eframe::App for App {
         self.poll_torrent_handoff();
         ctx.request_repaint();
 
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        if platform::consume_show_request() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
+        if !ctx.wants_keyboard_input() && self.player.now_playing.lock().unwrap().is_some() {
+            let status = self.player.status.lock().unwrap().clone();
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::Space) {
+                    self.player.toggle_pause();
+                }
+                if let Some(status) = &status {
+                    if i.key_pressed(egui::Key::ArrowRight) {
+                        self.player.seek((status.time + 10.0).max(0.0));
+                    }
+                    if i.key_pressed(egui::Key::ArrowLeft) {
+                        self.player.seek((status.time - 10.0).max(0.0));
+                    }
+                }
+            });
+        }
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Slash) || (i.modifiers.command && i.key_pressed(egui::Key::F))) {
+            self.tab = Tab::Search;
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("aniani");
@@ -494,6 +563,8 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.tab, Tab::Discover, "discover");
                     ui.selectable_value(&mut self.tab, Tab::Search, "search");
                     ui.selectable_value(&mut self.tab, Tab::Downloads, "downloads");
+                    ui.selectable_value(&mut self.tab, Tab::History, "history");
+                    ui.selectable_value(&mut self.tab, Tab::Settings, "settings");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -508,18 +579,11 @@ impl eframe::App for App {
                             self.tab = Tab::Search;
                         }
                     }
-                    egui::ComboBox::from_id_salt("player_backend")
-                        .selected_text(&self.prefs.player)
-                        .show_ui(ui, |ui| {
-                            if ui.selectable_label(self.prefs.player == "mpv", "mpv").clicked() {
-                                self.prefs.player = "mpv".into();
-                                self.player.set_backend("mpv");
-                            }
-                            if ui.selectable_label(self.prefs.player == "vlc", "vlc").clicked() {
-                                self.prefs.player = "vlc".into();
-                                self.player.set_backend("vlc");
-                            }
-                        });
+                    if let Some(latest) = self.update_available.lock().unwrap().clone() {
+                        if ui.button(format!("v{latest} available")).on_hover_text("open the releases page").clicked() {
+                            let _ = open::that("https://github.com/arshnah/aniani/releases/latest");
+                        }
+                    }
                 });
             });
         });
@@ -577,6 +641,51 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
             Tab::Discover => {
+                ui.horizontal(|ui| {
+                    ui.label("browse:");
+                    let sorts = [("TRENDING_DESC", "trending"), ("POPULARITY_DESC", "popular"), ("SCORE_DESC", "top rated"), ("START_DATE_DESC", "newest")];
+                    let mut sort_changed = false;
+                    egui::ComboBox::from_id_salt("discover_sort")
+                        .selected_text(sorts.iter().find(|(k, _)| *k == self.discover_sort).map(|(_, l)| *l).unwrap_or("trending"))
+                        .show_ui(ui, |ui| {
+                            for (key, label) in sorts {
+                                if ui.selectable_label(self.discover_sort == key, label).clicked() {
+                                    self.discover_sort = key.to_string();
+                                    sort_changed = true;
+                                }
+                            }
+                        });
+                    let genres = ["Action", "Adventure", "Comedy", "Drama", "Fantasy", "Horror", "Mystery", "Romance", "Sci-Fi", "Slice of Life", "Sports", "Supernatural", "Thriller"];
+                    egui::ComboBox::from_id_salt("discover_genre")
+                        .selected_text(self.discover_genre.as_deref().unwrap_or("any genre"))
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(self.discover_genre.is_none(), "any genre").clicked() {
+                                self.discover_genre = None;
+                                sort_changed = true;
+                            }
+                            for genre in genres {
+                                if ui.selectable_label(self.discover_genre.as_deref() == Some(genre), genre).clicked() {
+                                    self.discover_genre = Some(genre.to_string());
+                                    sort_changed = true;
+                                }
+                            }
+                        });
+                    if sort_changed || (self.discover_sort != "TRENDING_DESC" || self.discover_genre.is_some()) && self.filtered_results.lock().unwrap().is_empty() {
+                        self.refresh_filtered();
+                    }
+                });
+
+                let custom_browse = self.discover_sort != "TRENDING_DESC" || self.discover_genre.is_some();
+                if custom_browse {
+                    let filtered = self.filtered_results.lock().unwrap().clone();
+                    ui.heading("browse results");
+                    if let Some(a) = self.anime_grid(ui, "filtered", &filtered) {
+                        self.anime_detail = Some(a);
+                    }
+                    ui.add_space(20.0);
+                    return;
+                }
+
                 let mut clicked = None;
                 let mut continue_watching_clicked = None;
                 let continue_watching = self.continue_watching.lock().unwrap().clone();
@@ -599,63 +708,35 @@ impl eframe::App for App {
                     clicked = Some(t);
                 }
                 ui.add_space(20.0);
-                if let Some(title) = continue_watching_clicked {
-                    self.resume_continue_watching(&title);
+                if let Some(anime) = continue_watching_clicked {
+                    self.resume_continue_watching(&anime.title);
                 }
-                if let Some(title) = clicked {
-                    self.open_in_search(&title);
+                if let Some(anime) = clicked {
+                    self.anime_detail = Some(anime);
                 }
 
-                ui.separator();
-                ui.heading("anilist");
-                let username = self.anilist_username.lock().unwrap().clone();
-                if let Some(name) = username {
-                    ui.label(format!("connected as {name}"));
-                    ui.checkbox(&mut self.prefs.anilist_sync, "sync watched episodes");
-                    if ui.button("disconnect").clicked() {
-                        tracker::clear_token();
-                        *self.anilist_username.lock().unwrap() = None;
-                        self.anilist_list.lock().unwrap().clear();
+                let anilist_list = self.anilist_list.lock().unwrap().clone();
+                if !anilist_list.is_empty() {
+                    ui.separator();
+                    ui.heading("watching, from your AniList list");
+                    let as_anime: Vec<sources::Anime> = anilist_list
+                        .iter()
+                        .map(|e| sources::Anime {
+                            title: e.title.clone(),
+                            episodes: e.episodes,
+                            score: None,
+                            status: Some(e.status.clone()),
+                            genres: vec![],
+                            description: match e.episodes {
+                                Some(total) => format!("episode {} of {total} on AniList", e.progress),
+                                None => format!("episode {} on AniList", e.progress),
+                            },
+                            cover: e.cover.clone(),
+                        })
+                        .collect();
+                    if let Some(anime) = self.anime_grid(ui, "anilist_list", &as_anime) {
+                        self.anime_detail = Some(anime);
                     }
-                    let anilist_list = self.anilist_list.lock().unwrap().clone();
-                    if !anilist_list.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label("watching, from your AniList list:");
-                        let as_anime: Vec<sources::Anime> = anilist_list
-                            .iter()
-                            .map(|e| sources::Anime {
-                                title: e.title.clone(),
-                                episodes: e.episodes,
-                                score: None,
-                                status: Some(e.status.clone()),
-                                genres: vec![],
-                                description: match e.episodes {
-                                    Some(total) => format!("episode {} of {total} on AniList", e.progress),
-                                    None => format!("episode {} on AniList", e.progress),
-                                },
-                                cover: e.cover.clone(),
-                            })
-                            .collect();
-                        if let Some(title) = self.anime_grid(ui, "anilist_list", &as_anime) {
-                            self.open_in_search(&title);
-                        }
-                    }
-                } else {
-                    ui.label("paste your AniList client id, open the authorize link, then paste the token back:");
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.anilist_client_id_input);
-                        if ui.button("open authorize page").clicked() && !self.anilist_client_id_input.is_empty() {
-                            let _ = open::that(tracker::authorize_url(&self.anilist_client_id_input));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.anilist_pin_input);
-                        if ui.button("connect").clicked() && !self.anilist_pin_input.is_empty() {
-                            tracker::save_token(&self.anilist_pin_input);
-                            self.refresh_anilist_username();
-                            self.refresh_anilist_list();
-                        }
-                    });
                 }
             }
             Tab::Search => {
@@ -709,8 +790,36 @@ impl eframe::App for App {
                     ui.heading(&sel_title);
                     let mut to_play: Option<(String, String)> = None;
                     let mut to_download: Option<(String, String)> = None;
+                    let selected_count = self.selected_episodes.len();
+                    ui.horizontal(|ui| {
+                        if ui.button("select all").clicked() {
+                            self.selected_episodes = episodes.iter().map(|e| e.ep_no.clone()).collect();
+                        }
+                        if ui.button("select none").clicked() {
+                            self.selected_episodes.clear();
+                        }
+                        if selected_count > 0 && ui.button(format!("download {selected_count} selected")).clicked() {
+                            for ep in &episodes {
+                                if self.selected_episodes.contains(&ep.ep_no) {
+                                    to_download = Some((ep.ep_ref.clone(), ep.ep_no.clone()));
+                                    if let Some((ep_ref, ep_no)) = to_download.take() {
+                                        self.download_episode(&ep_ref, &ep_no);
+                                    }
+                                }
+                            }
+                            self.selected_episodes.clear();
+                        }
+                    });
                     for ep in &episodes {
                         ui.horizontal(|ui| {
+                            let mut checked = self.selected_episodes.contains(&ep.ep_no);
+                            if ui.checkbox(&mut checked, "").changed() {
+                                if checked {
+                                    self.selected_episodes.insert(ep.ep_no.clone());
+                                } else {
+                                    self.selected_episodes.remove(&ep.ep_no);
+                                }
+                            }
                             if ui.button(format!("episode {}", ep.ep_no)).clicked() {
                                 to_play = Some((ep.ep_ref.clone(), ep.ep_no.clone()));
                             }
@@ -774,8 +883,123 @@ impl eframe::App for App {
                     });
                 }
             }
+            Tab::History => {
+                let history = state::read_history();
+                if history.is_empty() {
+                    ui.label(egui::RichText::new("nothing watched yet").color(theme::MUTED));
+                }
+                for entry in history.iter().rev() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} · episode {} · {}", entry.anime_title, entry.ep_no, entry.source));
+                        if ui.button("open in search").clicked() {
+                            self.open_in_search(&entry.anime_title);
+                        }
+                    });
+                }
+            }
+            Tab::Settings => {
+                ui.heading("player");
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.prefs.player == "mpv", "mpv").clicked() {
+                        self.prefs.player = "mpv".into();
+                        self.player.set_backend("mpv");
+                    }
+                    if ui.selectable_label(self.prefs.player == "vlc", "vlc").clicked() {
+                        self.prefs.player = "vlc".into();
+                        self.player.set_backend("vlc");
+                    }
+                });
+
+                ui.separator();
+                ui.heading("anilist");
+                let username = self.anilist_username.lock().unwrap().clone();
+                if let Some(name) = username {
+                    ui.label(format!("connected as {name}"));
+                    ui.checkbox(&mut self.prefs.anilist_sync, "sync watched episodes");
+                    if ui.button("disconnect").clicked() {
+                        tracker::clear_token();
+                        *self.anilist_username.lock().unwrap() = None;
+                        self.anilist_list.lock().unwrap().clear();
+                    }
+                } else {
+                    ui.label("paste your AniList client id, open the authorize link, then paste the token back:");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.anilist_client_id_input);
+                        if ui.button("open authorize page").clicked() && !self.anilist_client_id_input.is_empty() {
+                            let _ = open::that(tracker::authorize_url(&self.anilist_client_id_input));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.anilist_pin_input);
+                        if ui.button("connect").clicked() && !self.anilist_pin_input.is_empty() {
+                            tracker::save_token(&self.anilist_pin_input);
+                            self.refresh_anilist_username();
+                            self.refresh_anilist_list();
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.heading("about");
+                ui.label(format!("aniani v{}", env!("CARGO_PKG_VERSION")));
+                if ui.button("check for updates").clicked() {
+                    self.check_for_update();
+                }
+            }
             });
         });
+
+        if let Some(anime) = self.anime_detail.clone() {
+            let mut open = true;
+            let mut watch = false;
+            let mut close_clicked = false;
+            egui::Window::new(&anime.title)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.horizontal(|ui| {
+                        if let Some(cover) = &anime.cover {
+                            ui.add(egui::Image::new(cover).fit_to_exact_size(egui::vec2(140.0, 200.0)).rounding(6.0));
+                        }
+                        ui.vertical(|ui| {
+                            if let Some(score) = anime.score {
+                                ui.label(format!("★ {score}% rated"));
+                            }
+                            if let Some(status) = &anime.status {
+                                ui.label(format!("status: {status}"));
+                            }
+                            if let Some(eps) = anime.episodes {
+                                ui.label(format!("{eps} episodes"));
+                            }
+                            if !anime.genres.is_empty() {
+                                ui.label(anime.genres.join(", "));
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    if !anime.description.is_empty() {
+                        ui.label(&anime.description);
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("watch").clicked() {
+                            watch = true;
+                        }
+                        if ui.button("close").clicked() {
+                            close_clicked = true;
+                        }
+                    });
+                });
+            if watch {
+                self.open_in_search(&anime.title);
+                self.anime_detail = None;
+            } else if !open || close_clicked {
+                self.anime_detail = None;
+            }
+        }
 
         let elapsed = frame_start.elapsed();
         if elapsed > Duration::from_millis(100) {
@@ -789,6 +1013,15 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    std::panic::set_hook(Box::new(|info| {
+        platform::debug_log(&format!("panic: {info}"));
+    }));
+
+    if !platform::acquire_single_instance_lock() {
+        platform::request_show_running_instance();
+        return Ok(());
+    }
+
     eframe::run_native(
         "aniani",
         eframe::NativeOptions::default(),

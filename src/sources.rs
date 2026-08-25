@@ -32,9 +32,9 @@ pub struct WatchLink {
 const ANILIST_URL: &str = "https://graphql.anilist.co";
 
 const QUERY: &str = r#"
-query ($sort: [MediaSort], $perPage: Int) {
+query ($sort: [MediaSort], $perPage: Int, $genre: String) {
   Page(page: 1, perPage: $perPage) {
-    media(type: ANIME, sort: $sort) {
+    media(type: ANIME, sort: $sort, genre: $genre) {
       title { romaji english }
       episodes
       averageScore
@@ -82,10 +82,10 @@ struct CoverRaw {
     large: Option<String>,
 }
 
-pub async fn anilist_fetch(client: &reqwest::Client, sort: &str, per_page: i32) -> anyhow::Result<Vec<Anime>> {
+pub async fn anilist_fetch(client: &reqwest::Client, sort: &str, per_page: i32, genre: Option<&str>) -> anyhow::Result<Vec<Anime>> {
     let body = json!({
         "query": QUERY,
-        "variables": {"sort": [sort], "perPage": per_page}
+        "variables": {"sort": [sort], "perPage": per_page, "genre": genre}
     });
     let resp: GraphQlEnvelope = client.post(ANILIST_URL).json(&body).send().await?.json().await?;
     let media = resp.data.map(|d| d.page.media).unwrap_or_default();
@@ -107,11 +107,15 @@ pub async fn anilist_fetch(client: &reqwest::Client, sort: &str, per_page: i32) 
 }
 
 pub async fn trending(client: &reqwest::Client) -> anyhow::Result<Vec<Anime>> {
-    anilist_fetch(client, "TRENDING_DESC", 25).await
+    anilist_fetch(client, "TRENDING_DESC", 25, None).await
 }
 
 pub async fn popular(client: &reqwest::Client) -> anyhow::Result<Vec<Anime>> {
-    anilist_fetch(client, "POPULARITY_DESC", 25).await
+    anilist_fetch(client, "POPULARITY_DESC", 25, None).await
+}
+
+pub async fn discover_filtered(client: &reqwest::Client, sort: &str, genre: Option<&str>) -> anyhow::Result<Vec<Anime>> {
+    anilist_fetch(client, sort, 25, genre).await
 }
 
 const JIKAN_URL: &str = "https://api.jikan.moe/v4";
@@ -211,7 +215,7 @@ pub async fn jikan_cover_for_title(client: &reqwest::Client, title: &str) -> Opt
     body.data.into_iter().next()?.images?.jpg?.large_image_url
 }
 
-pub async fn cover_for_title(client: &reqwest::Client, title: &str) -> Option<String> {
+async fn cover_for_title_uncached(client: &reqwest::Client, title: &str) -> Option<String> {
     if let Some(c) = jikan_cover_for_title(client, title).await {
         return Some(c);
     }
@@ -235,6 +239,36 @@ pub async fn cover_for_title(client: &reqwest::Client, title: &str) -> Option<St
         }
     };
     body.get("data")?.get("Media")?.get("coverImage")?.get("large")?.as_str().map(|s| s.to_string())
+}
+
+fn cover_cache_path() -> std::path::PathBuf {
+    crate::platform::state_dir("aniani").join("cover_cache.json")
+}
+
+fn load_cover_cache() -> std::collections::HashMap<String, Option<String>> {
+    std::fs::read_to_string(cover_cache_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_cover_cache(cache: &std::collections::HashMap<String, Option<String>>) {
+    let _ = std::fs::create_dir_all(crate::platform::state_dir("aniani"));
+    if let Ok(s) = serde_json::to_string(cache) {
+        let _ = std::fs::write(cover_cache_path(), s);
+    }
+}
+
+pub async fn cover_for_title(client: &reqwest::Client, title: &str) -> Option<String> {
+    let cache = load_cover_cache();
+    if let Some(cached) = cache.get(title) {
+        return cached.clone();
+    }
+    let result = cover_for_title_uncached(client, title).await;
+    let mut cache = load_cover_cache();
+    cache.insert(title.to_string(), result.clone());
+    save_cover_cache(&cache);
+    result
 }
 
 const COVER_QUERY: &str = r#"
@@ -392,4 +426,30 @@ pub fn anidb_watch(ep_ref: &str, dub: bool) -> anyhow::Result<Option<WatchLink>>
         }
     }
     Ok(best.map(|(_, url)| WatchLink { url, referer: None }))
+}
+
+pub async fn latest_release_tag(client: &reqwest::Client) -> Option<String> {
+    let resp = client
+        .get("https://api.github.com/repos/arshnah/aniani/releases/latest")
+        .header("User-Agent", "aniani")
+        .send()
+        .await
+        .ok()?;
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string())
+}
+
+pub fn is_newer_version(latest: &str, current: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    }
+    let (l, c) = (parts(latest), parts(current));
+    for i in 0..l.len().max(c.len()) {
+        let lv = l.get(i).copied().unwrap_or(0);
+        let cv = c.get(i).copied().unwrap_or(0);
+        if lv != cv {
+            return lv > cv;
+        }
+    }
+    false
 }

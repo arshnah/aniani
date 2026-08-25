@@ -70,14 +70,16 @@ needed at all.
 
 ## AniList tracker sync
 
-Optional, off by default. When enabled, finishing an episode pushes
-your progress to your AniList list. One-time setup: create a free
-client at
+Two-way. Optional push, off by default: when enabled, finishing an
+episode pushes your progress to your AniList list. One-time setup:
+create a free client at
 [anilist.co/settings/developer](https://anilist.co/settings/developer)
 with redirect URL `https://anilist.co/api/v2/oauth/pin`, paste the
 client id in, open the authorize page, paste the token back. No local
-webserver or redirect handler needed. Currently one-way (local watch
-pushes to AniList, no pulling an existing list).
+webserver or redirect handler needed. Pull happens automatically once
+connected: your CURRENT/REPEATING list shows up as its own row on the
+Discover tab, click one to jump to search. No in-app editing of AniList
+entries beyond what playing an episode already pushes.
 
 ## Discord Rich Presence
 
@@ -94,6 +96,31 @@ of its documented outages. Clicking a continue-watching card checks if
 that episode is already downloaded and plays it straight from disk if
 so, instead of re-resolving a live stream.
 
+## Closing the window / running in the background
+
+Closing the window hides it instead of quitting -- Discord presence and
+playback keep running. Launching `aniani`/`aniani.exe` again while it's
+already running doesn't open a second window, it just un-hides and
+focuses the existing one (an `fd-lock`-based single-instance lock plus
+a signal file, checked in `platform.rs`/`main.rs`). This is not a real
+system tray icon -- there's no click-to-restore from a tray area, the
+only way back in right now is relaunching the exe. A proper tray icon
+would need the `tray-icon` crate wired into eframe's own winit event
+loop, a bigger integration not attempted here.
+
+## Other extras
+
+Update checker (pings this repo's GitHub releases API on launch, shows
+a banner if newer), a disk-backed cover image cache (`cover_cache.json`
+in the state dir, so covers aren't re-fetched over the network on every
+launch), keyboard shortcuts while playing (space to pause, left/right
+arrows to seek ±10s, `/` or ctrl/cmd+F to jump to search), an anime
+detail popup before committing to a source search (synopsis, genres,
+score, episode count), batch episode selection + download, a full
+History tab (all watch history, not just the last 20), and genre/sort
+filtering on Discover. A panic hook writes crashes to `debug.log`
+instead of vanishing with the hidden console window.
+
 ## Setup
 
 Needs `curl_chrome136` (curl-impersonate, for anidb.app), `mpv` and/or
@@ -106,14 +133,12 @@ cargo build --release
 
 ## Platform support
 
-Built and daily-driven on Linux (Arch/Hyprland). Windows support
-exists in the source -- `platform.rs` has the Windows state/download
-dirs, mpv named-pipe IPC, and vlc/mpv/qbittorrent install-path
-fallbacks -- but **hasn't actually been compiled or run on Windows by
-hand yet**, only through this repo's own GitHub Actions Windows
-runner. Treat it as "should build, needs a real Windows machine to
-actually trust." `qbittorrent-nox` has no Windows build, falls back to
-the regular qBittorrent GUI (same WebUI API, just shows a window).
+Built and daily-driven on Linux (Arch/Hyprland). Windows now compiles
+and runs on real hardware, confirmed on two separate machines, not
+just via this repo's GitHub Actions Windows runner. `qbittorrent-nox`
+has no Windows build, falls back to the regular qBittorrent GUI (same
+WebUI API, just shows a window). Still only tested on a couple of
+machines -- not broad hardware/driver coverage.
 
 macOS: untested, not a current target. The `dirs`-crate-based paths
 and the Unix-socket mpv IPC path should carry over as-is; VLC/mpv
@@ -121,7 +146,7 @@ binary discovery would need `/Applications` fallbacks added.
 
 ## What's left
 
-See `TODO.txt` -- yuma stream resolution, resume-seek-bar/volume/speed
-controls in the UI (backend methods exist, not wired to a widget),
-two-way AniList sync, the compact/floating-panel mode the Python
-version had.
+See `TODO.txt` -- yuma stream resolution (not planned), a real system
+tray icon with click-to-restore (currently: hide-on-close +
+relaunch-to-restore, not a tray icon), macOS support (completely
+untouched), and broader Windows hardware testing.

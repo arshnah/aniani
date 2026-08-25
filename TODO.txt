@@ -15,3 +15,19 @@ progress up, and my_list() pulls your CURRENT/REPEATING list back down,
 shown as its own row on the discover tab (click one to jump to
 search). no in-app editing of anilist entries beyond what playing an
 episode already pushes.
+
+system tray / minimize instead of quit: done, but honestly scoped down
+from a real tray icon. closing the window now hides it instead of
+quitting (close_requested -> CancelClose + Visible(false)), so discord
+presence and the worker thread keep running in the background. an
+fd-lock-based single-instance lock means launching the exe again while
+it's already running doesn't spawn a second process -- it writes a
+"show" signal file and exits immediately, and the original instance
+picks that up and un-hides + focuses itself. no actual system tray
+icon (no click-to-restore from the taskbar tray area) -- that needs
+the `tray-icon` crate wired into eframe's own winit event loop, which
+is a bigger, riskier integration i didn't attempt. right now the only
+way back in is relaunching the exe.
+
+macos: still completely untouched, no testing, no binary-discovery
+fallback paths added for /Applications.

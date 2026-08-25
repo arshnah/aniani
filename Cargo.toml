@@ -1,6 +1,6 @@
 [package]
 name = "aniani"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 
 [dependencies]
@@ -23,6 +23,7 @@ dirs = "5"
 which = "6"
 discord-rich-presence = "0.2"
 regex = "1"
+fd-lock = "4"
 
 [profile.release]
 opt-level = 3

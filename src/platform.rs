@@ -92,6 +92,39 @@ pub fn debug_log(msg: &str) {
     }
 }
 
+pub fn acquire_single_instance_lock() -> bool {
+    let _ = std::fs::create_dir_all(state_dir("aniani"));
+    let path = state_dir("aniani").join("aniani.lock");
+    let Ok(file) = std::fs::OpenOptions::new().create(true).write(true).open(path) else { return false };
+    let lock: &'static mut fd_lock::RwLock<std::fs::File> = Box::leak(Box::new(fd_lock::RwLock::new(file)));
+    match lock.try_write() {
+        Ok(guard) => {
+            std::mem::forget(guard);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn show_signal_path() -> PathBuf {
+    state_dir("aniani").join("aniani.show")
+}
+
+pub fn request_show_running_instance() {
+    let _ = std::fs::create_dir_all(state_dir("aniani"));
+    let _ = std::fs::write(show_signal_path(), b"");
+}
+
+pub fn consume_show_request() -> bool {
+    let path = show_signal_path();
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        true
+    } else {
+        false
+    }
+}
+
 pub fn find_curl_impersonate() -> Option<String> {
     let names = ["curl_chrome136", "curl_chrome136.exe", "curl-impersonate-chrome.exe"];
     if let Some(found) = find_binary(&names) {
