@@ -160,6 +160,8 @@ pub struct VlcPlayer {
     port: u16,
     password: String,
     client: reqwest::blocking::Client,
+    shared_pid: Option<u32>,
+    window_ever_seen: bool,
 }
 
 fn free_port() -> u16 {
@@ -169,16 +171,33 @@ fn free_port() -> u16 {
         .unwrap_or(9091)
 }
 
+fn vlc_port_path() -> std::path::PathBuf {
+    platform::temp_path("aniani-vlc-port")
+}
+
+fn vlc_pid_path() -> std::path::PathBuf {
+    platform::temp_path("aniani-vlc-pid")
+}
+
+fn vlc_password_path() -> std::path::PathBuf {
+    platform::temp_path("aniani-vlc-password")
+}
+
 impl VlcPlayer {
     pub fn new() -> Self {
+        let shared_port = std::fs::read_to_string(vlc_port_path()).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(9091);
+        let shared_pid = std::fs::read_to_string(vlc_pid_path()).ok().and_then(|s| s.trim().parse().ok());
+        let shared_password = std::fs::read_to_string(vlc_password_path()).ok().unwrap_or_default();
         VlcPlayer {
             proc: None,
-            port: 9091,
-            password: String::new(),
+            port: shared_port,
+            password: shared_password,
             client: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_millis(1500))
                 .build()
                 .unwrap(),
+            shared_pid,
+            window_ever_seen: false,
         }
     }
 
@@ -189,14 +208,43 @@ impl VlcPlayer {
     pub fn is_running(&mut self) -> bool {
         match &mut self.proc {
             Some(p) => matches!(p.try_wait(), Ok(None)),
+            None => {
+                #[cfg(target_os = "linux")]
+                {
+                    self.shared_pid
+                        .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+                        .unwrap_or(false)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    false
+                }
+            }
+        }
+    }
+
+    pub fn window_gone(&mut self) -> bool {
+        if !self.is_running() {
+            return false;
+        }
+        let pid = self.proc.as_ref().map(|p| p.id()).or(self.shared_pid);
+        match platform::hyprland_window_exists("vlc", pid) {
+            Some(true) => {
+                self.window_ever_seen = true;
+                false
+            }
+            Some(false) => self.window_ever_seen,
             None => false,
         }
     }
 
     pub fn play(&mut self, url: &str, title: Option<&str>, referer: Option<&str>, start_seconds: Option<f64>) {
         self.stop();
+        self.window_ever_seen = false;
         self.port = free_port();
         self.password = format!("{:032x}", rand::random::<u128>());
+        let _ = std::fs::write(vlc_port_path(), self.port.to_string());
+        let _ = std::fs::write(vlc_password_path(), &self.password);
 
         let vlc_bin = platform::find_vlc().unwrap_or_else(|| "vlc".to_string());
         let mut cmd = Command::new(vlc_bin);
@@ -219,6 +267,10 @@ impl VlcPlayer {
         cmd.arg(url);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         self.proc = cmd.spawn().ok();
+        self.shared_pid = self.proc.as_ref().map(|p| p.id());
+        if let Some(pid) = self.shared_pid {
+            let _ = std::fs::write(vlc_pid_path(), pid.to_string());
+        }
     }
 
     fn status(&self, command: Option<&str>, extra: &[(&str, &str)]) -> Option<Value> {
@@ -273,6 +325,8 @@ impl VlcPlayer {
         if let Some(mut p) = self.proc.take() {
             let _ = p.kill();
             let _ = p.wait();
+        } else if let Some(pid) = self.shared_pid.take() {
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
         }
     }
 }
@@ -333,6 +387,12 @@ impl Backend {
     pub fn cycle_audio(&mut self) {
         if let Backend::Mpv(p) = self {
             p.cycle_audio();
+        }
+    }
+    pub fn window_gone(&mut self) -> bool {
+        match self {
+            Backend::Vlc(p) => p.window_gone(),
+            Backend::Mpv(_) => false,
         }
     }
     pub fn stop(&mut self) {

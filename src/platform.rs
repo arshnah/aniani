@@ -125,6 +125,18 @@ pub fn consume_show_request() -> bool {
     }
 }
 
+pub fn hyprland_window_exists(window_class: &str, pid: Option<u32>) -> Option<bool> {
+    let hyprctl = which::which("hyprctl").ok()?;
+    let out = std::process::Command::new(hyprctl).args(["clients", "-j"]).output().ok()?;
+    let clients: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let arr = clients.as_array()?;
+    Some(arr.iter().any(|c| {
+        let class_match = c.get("class").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case(window_class)).unwrap_or(false);
+        let pid_match = pid.is_some() && c.get("pid").and_then(|v| v.as_u64()) == pid.map(|p| p as u64);
+        class_match || pid_match
+    }))
+}
+
 pub fn find_curl_impersonate() -> Option<String> {
     let names = ["curl_chrome136", "curl_chrome136.exe", "curl-impersonate-chrome.exe"];
     if let Some(found) = find_binary(&names) {

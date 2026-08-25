@@ -86,6 +86,13 @@ impl PlayerHandle {
                 }
 
                 let now_playing = thread_now_playing.lock().unwrap().clone();
+                if now_playing.is_some() && backend.window_gone() {
+                    backend.stop();
+                    *thread_now_playing.lock().unwrap() = None;
+                    *thread_status.lock().unwrap() = None;
+                    discord.browsing("idle");
+                    continue;
+                }
                 if let Some((show, ep)) = &now_playing {
                     let t0 = std::time::Instant::now();
                     let status = backend.get_status();
