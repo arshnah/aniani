@@ -31,3 +31,17 @@ way back in is relaunching the exe.
 
 macos: still completely untouched, no testing, no binary-discovery
 fallback paths added for /Applications.
+
+vlc window-close detection + reattach: done, linux/hyprland only.
+VLC's -I dummy interface means its process lifecycle isn't tied to its
+own video window at all -- closing that window directly (e.g.
+super+q) used to leave the process running as an orphan the app never
+noticed. window_gone() polls `hyprctl clients -j` for a window
+matching the vlc process's pid/class; once a window's been seen and
+then goes missing while the process is still alive, the worker thread
+stops it and cleans up state, same as a normal user-initiated stop.
+also reattaches to an already-running vlc instance after a relaunch:
+VlcPlayer::new() now reads the shared port/pid/password files a
+previous run wrote, instead of always starting from a blank slate.
+windows/macos get none of this -- hyprctl doesn't exist there, so
+window_gone() always returns false (safe default, not "broken").

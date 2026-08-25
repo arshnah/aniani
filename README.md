@@ -108,6 +108,19 @@ only way back in right now is relaunching the exe. A proper tray icon
 would need the `tray-icon` crate wired into eframe's own winit event
 loop, a bigger integration not attempted here.
 
+## VLC window-close handling (Linux/Hyprland)
+
+VLC's `-I dummy` interface means its process lifecycle isn't tied to
+its own video window -- closing that window directly (e.g. Super+Q)
+leaves the process running as an orphan otherwise. On Hyprland, the
+worker thread polls `hyprctl clients -j` to notice when a window it
+saw has gone missing while the process is still alive, and cleans it
+up the same as a normal stop. Also reattaches to an already-running
+VLC instance after a relaunch, instead of always starting from a blank
+slate, by reading the port/pid/password a previous run wrote to shared
+temp files. Windows/macOS get neither -- `hyprctl` doesn't exist
+there, so this safely does nothing rather than breaking anything.
+
 ## Other extras
 
 Update checker (pings this repo's GitHub releases API on launch, shows
