@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 mod discord;
 mod download;
 mod ipc;
@@ -157,19 +159,17 @@ impl App {
             SearchSource::AniDb => {
                 let q = self.search_query.clone();
                 let out = self.anidb_results.clone();
-                std::thread::spawn(move || {
-                    if let Ok(v) = sources::anidb_search(&q) {
-                        *out.lock().unwrap() = v;
-                    }
+                std::thread::spawn(move || match sources::anidb_search(&q) {
+                    Ok(v) => *out.lock().unwrap() = v,
+                    Err(e) => platform::debug_log(&format!("anidb_search({q}) failed: {e}")),
                 });
             }
             SearchSource::Yuma => {
                 let q = self.search_query.clone();
                 let out = self.yuma_results.clone();
-                std::thread::spawn(move || {
-                    if let Ok(v) = yuma::search(&q) {
-                        *out.lock().unwrap() = v;
-                    }
+                std::thread::spawn(move || match yuma::search(&q) {
+                    Ok(v) => *out.lock().unwrap() = v,
+                    Err(e) => platform::debug_log(&format!("yuma::search({q}) failed: {e}")),
                 });
             }
             SearchSource::Nyaa => {
@@ -346,7 +346,7 @@ impl App {
                                 }
                             });
                         });
-                    let resp = ui.interact(frame.response.rect, ui.id().with(&anime.title), egui::Sense::click());
+                    let resp = frame.response.interact(egui::Sense::click());
                     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if anime.description.is_empty() {
                         anime.title.clone()
                     } else {
