@@ -86,7 +86,10 @@ impl PlayerHandle {
                 }
 
                 let now_playing = thread_now_playing.lock().unwrap().clone();
-                if now_playing.is_some() && backend.window_gone() {
+                // The player ended on its own (playback finished, user quit mpv/vlc) or
+                // the user closed the VLC window on Hyprland. Either way, stop showing a
+                // ghost player bar and drop Discord presence back to idle.
+                if now_playing.is_some() && (backend.has_exited() || backend.window_gone()) {
                     backend.stop();
                     *thread_now_playing.lock().unwrap() = None;
                     *thread_status.lock().unwrap() = None;

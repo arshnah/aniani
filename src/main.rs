@@ -46,6 +46,13 @@ struct SelectedAnime {
     episodes: Arc<Mutex<Vec<sources::Episode>>>,
 }
 
+struct PendingPlay {
+    link: sources::WatchLink,
+    sel: SelectedAnime,
+    ep_no: String,
+    canonical: i64,
+}
+
 struct App {
     rt: tokio::runtime::Runtime,
     http: reqwest::Client,
@@ -58,6 +65,9 @@ struct App {
     search_query: String,
     search_source: SearchSource,
     anidb_results: Arc<Mutex<Vec<sources::SearchResult>>>,
+    /// When set, the next anidb search results should be matched against this title and
+    /// the best match auto-selected, skipping the manual result pick (discover -> watch).
+    auto_select: Option<String>,
     yuma_results: Arc<Mutex<Vec<sources::SearchResult>>>,
     nyaa_results: Arc<Mutex<Vec<torrent::TorrentResult>>>,
 
@@ -74,6 +84,7 @@ struct App {
 
     media_cache: Arc<Mutex<HashMap<String, discord::MediaInfo>>>,
     pending_torrent_playback: Arc<Mutex<Option<(std::path::PathBuf, String)>>>,
+    pending_play: Arc<Mutex<Option<PendingPlay>>>,
 
     downloads: Vec<Arc<download::DownloadJob>>,
     downloaded_library: Arc<Mutex<Vec<download::DownloadedShow>>>,
@@ -107,6 +118,7 @@ impl App {
             search_query: String::new(),
             search_source: SearchSource::AniDb,
             anidb_results: Arc::new(Mutex::new(vec![])),
+            auto_select: None,
             yuma_results: Arc::new(Mutex::new(vec![])),
             nyaa_results: Arc::new(Mutex::new(vec![])),
             selected: None,
@@ -119,6 +131,7 @@ impl App {
             anilist_list: Arc::new(Mutex::new(vec![])),
             media_cache,
             pending_torrent_playback: Arc::new(Mutex::new(None)),
+            pending_play: Arc::new(Mutex::new(None)),
             downloads: vec![],
             downloaded_library: Arc::new(Mutex::new(vec![])),
             seek_drag: None,
@@ -205,7 +218,16 @@ impl App {
         });
     }
 
-    fn run_search(&self) {
+    fn run_search(&mut self) {
+        // A fresh search cancels any pending auto-select from a previous one, and drops
+        // stale results up front so a slow new search can't be mistaken for the previous
+        // one's output (also what poll_auto_select waits on).
+        self.auto_select = None;
+        match self.search_source {
+            SearchSource::AniDb => self.anidb_results.lock().unwrap().clear(),
+            SearchSource::Yuma => self.yuma_results.lock().unwrap().clear(),
+            SearchSource::Nyaa => self.nyaa_results.lock().unwrap().clear(),
+        }
         match self.search_source {
             SearchSource::AniDb => {
                 let q = self.search_query.clone();
@@ -278,46 +300,74 @@ impl App {
     fn play_episode(&mut self, ep_ref: &str, ep_no: &str) {
         let Some(sel) = &self.selected else { return };
         let title = sel.title.clone();
-        let source_name = match sel.source {
+        let ep_ref = ep_ref.to_string();
+        let ep_no = ep_no.to_string();
+        let source = sel.source;
+        let anime_id = sel.id.clone();
+        let canonical = sel.episodes.lock().unwrap().iter().position(|e| e.ep_no == ep_no).map(|i| i as i64 + 1).unwrap_or(1);
+        let pending = self.pending_play.clone();
+        std::thread::spawn(move || {
+            let sel = SelectedAnime { title, id: anime_id, source, episodes: Arc::new(Mutex::new(vec![])) };
+            if let Some(link) = Self::resolve_link(&sel, &ep_ref) {
+                *pending.lock().unwrap() = Some(PendingPlay { link, sel, ep_no, canonical });
+            }
+        });
+    }
+
+    fn poll_pending_play(&mut self) {
+        let Some(p) = self.pending_play.lock().unwrap().take() else { return };
+        let source_name = match p.sel.source {
             StreamSource::AniDb => "anidb",
             StreamSource::Yuma => "yuma",
         };
-        let key = state::position_key(source_name, &title, ep_no);
+        let key = state::position_key(source_name, &p.sel.title, &p.ep_no);
         let resume_at = state::load_positions().get(&key).copied();
 
-        if let Some(link) = Self::resolve_link(sel, ep_ref) {
-            self.player.play(&link.url, &title, ep_no, link.referer, resume_at, source_name, &sel.id);
-            self.fetch_discord_cover(&title);
-            self.player.set_skip_times(None, None);
+        self.player.play(&p.link.url, &p.sel.title, &p.ep_no, p.link.referer, resume_at, source_name, &p.sel.id);
+        self.fetch_discord_cover(&p.sel.title);
+        self.player.set_skip_times(None, None);
 
-            if matches!(sel.source, StreamSource::AniDb) {
-                let anime_id = sel.id.clone();
-                let canonical = sel.episodes.lock().unwrap().iter().position(|e| e.ep_no == ep_no).map(|i| i as i64 + 1).unwrap_or(1);
-                let player = self.player.clone();
-                std::thread::spawn(move || {
-                    let Ok(Some(mal_id)) = sources::anidb_mal_id(&anime_id) else { return };
-                    let Ok(times) = sources::ani_skip_times(&mal_id, canonical) else { return };
-                    player.set_skip_times(times.op, times.ed);
-                });
-            }
+        if matches!(p.sel.source, StreamSource::AniDb) {
+            let anime_id = p.sel.id.clone();
+            let canonical = p.canonical;
+            let player = self.player.clone();
+            std::thread::spawn(move || {
+                let Ok(Some(mal_id)) = sources::anidb_mal_id(&anime_id) else { return };
+                let Ok(times) = sources::ani_skip_times(&mal_id, canonical) else { return };
+                player.set_skip_times(times.op, times.ed);
+            });
+        }
 
-            if self.prefs.anilist_sync {
-                let client = self.http.clone();
-                let t = title.clone();
-                let e = ep_no.to_string();
-                self.rt.spawn(async move {
-                    tracker::update_progress(&client, &t, &e).await;
-                });
-            }
+        if self.prefs.anilist_sync {
+            let client = self.http.clone();
+            let t = p.sel.title.clone();
+            let e = p.ep_no.clone();
+            self.rt.spawn(async move {
+                tracker::update_progress(&client, &t, &e).await;
+            });
         }
     }
 
     fn download_episode(&mut self, ep_ref: &str, ep_no: &str) {
         let Some(sel) = &self.selected else { return };
+        if !matches!(sel.source, StreamSource::AniDb) {
+            eprintln!("[yuma] download not supported yet, see TODO.txt");
+            return;
+        }
         let title = sel.title.clone();
         let ep_no = ep_no.to_string();
-        let Some(link) = Self::resolve_link(sel, ep_ref) else { return };
-        let job = download::DownloadJob::new(&title, &ep_no, &link.url, link.referer);
+        let job = download::DownloadJob::new(&title, &ep_no, ep_ref);
+        self.downloads.push(job.clone());
+        let library = self.downloaded_library.clone();
+        std::thread::spawn(move || {
+            download::run_job(&job);
+            *library.lock().unwrap() = download::list_downloaded();
+        });
+    }
+
+    fn retry_download(&mut self, failed: &Arc<download::DownloadJob>) {
+        let job = download::DownloadJob::new(&failed.anime_title, &failed.ep_no, &failed.ep_ref);
+        self.downloads.retain(|j| !Arc::ptr_eq(j, failed));
         self.downloads.push(job.clone());
         let library = self.downloaded_library.clone();
         std::thread::spawn(move || {
@@ -419,6 +469,106 @@ impl App {
         self.search_query = title.to_string();
         self.selected = None;
         self.run_search();
+        // After the results land, jump straight into the best title match's episodes.
+        self.auto_select = Some(title.to_string());
+    }
+
+    /// Picks the anidb result that best matches `want`, or None when nothing is close
+    /// enough to auto-select and the user should pick manually.
+    ///
+    /// Season-aware: sequels are separate entries on both catalogs but named
+    /// inconsistently ("Season 2", "2nd season", "II"). A result is only eligible when
+    /// its season agrees with the wanted one -- wanting Season 2 never auto-picks the
+    /// unmarked first season, and a marker-less want never auto-picks an explicit
+    /// sequel.
+    fn best_result_match<'a>(want: &str, results: &'a [sources::SearchResult]) -> Option<&'a sources::SearchResult> {
+        /// Splits "Mushoku Tensei II" into ("Mushoku Tensei", Some(2)). Understands
+        /// "season N", "Nth season", standalone roman numerals II-IV, and a trailing
+        /// standalone number.
+        fn split_season(title: &str) -> (String, Option<u32>) {
+            let patterns = [
+                regex::Regex::new(r"(?i)\bseason\s*(\d+)\b").unwrap(),
+                regex::Regex::new(r"(?i)\b(\d+)(?:nd|rd|th)\s+season\b").unwrap(),
+                regex::Regex::new(r"\b(II|III|IV)\b").unwrap(),
+                regex::Regex::new(r"\s(\d+)$").unwrap(),
+            ];
+            let romans = [("II", 2u32), ("III", 3), ("IV", 4)];
+            for (i, re) in patterns.iter().enumerate() {
+                if let Some(c) = re.captures(title) {
+                    let num = c.get(1).unwrap();
+                    let whole = c.get(0).unwrap();
+                    let n = match i {
+                        2 => romans.iter().find(|(r, _)| r.eq_ignore_ascii_case(num.as_str())).map(|(_, v)| *v),
+                        _ => num.as_str().parse().ok(),
+                    };
+                    if let Some(n) = n {
+                        // Strip the whole matched span ("2nd Season", not just "2"),
+                        // otherwise the base keeps fragments like "nd Season".
+                        let mut base = String::with_capacity(title.len());
+                        base.push_str(&title[..whole.start()]);
+                        base.push_str(&title[whole.end()..]);
+                        return (base, Some(n));
+                    }
+                }
+            }
+            (title.to_string(), None)
+        }
+        fn norm(s: &str) -> String {
+            s.to_lowercase()
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        let (w_raw, w_season) = split_season(want);
+        let w = norm(&w_raw);
+
+        let mut best: Option<(u8, &sources::SearchResult)> = None;
+        for r in results {
+            let (t_raw, t_season) = split_season(&r.title);
+            if w_season != t_season {
+                continue;
+            }
+            let t = norm(&t_raw);
+            let score: u8 = if t == w {
+                3
+            } else if t.starts_with(&w) || w.starts_with(&t) {
+                2
+            } else if t.contains(&w) || w.contains(&t) {
+                1
+            } else {
+                continue;
+            };
+            if best.map(|(b, _)| score > b).unwrap_or(true) {
+                best = Some((score, r));
+            }
+        }
+        best.map(|(_, r)| r)
+    }
+
+    /// Fires the pending auto-select once anidb results are on screen. Only touches
+    /// anidb results while anidb is the active source, and gives up (leaving the manual
+    /// list) when nothing matches well enough.
+    fn poll_auto_select(&mut self) {
+        let Some(want) = self.auto_select.clone() else { return };
+        if self.search_source != SearchSource::AniDb || self.selected.is_some() {
+            self.auto_select = None;
+            return;
+        }
+        let results = self.anidb_results.lock().unwrap();
+        if results.is_empty() {
+            return; // search still in flight, keep waiting
+        }
+        if let Some(best) = Self::best_result_match(&want, &results) {
+            let id = best.id.clone();
+            let title = best.title.clone();
+            drop(results);
+            self.select_anime(&id, &title, StreamSource::AniDb);
+        }
+        self.auto_select = None;
     }
 
     fn resume_continue_watching(&mut self, title: &str) {
@@ -432,13 +582,7 @@ impl App {
             .map(|s| s.to_string());
 
         if let Some(ep_no) = &ep_no {
-            let already_downloaded = download::list_downloaded()
-                .into_iter()
-                .find(|s| s.title == title)
-                .map(|s| s.episodes.contains(ep_no))
-                .unwrap_or(false);
-            if already_downloaded {
-                let path = download::dest_path(title, ep_no);
+            if let Some(path) = download::find_episode_file(title, ep_no) {
                 self.player.play(&format!("file://{}", path.display()), title, ep_no, None, None, "downloaded", title);
                 self.fetch_discord_cover(title);
                 return;
@@ -480,6 +624,17 @@ mod theme {
     pub const MUTED: Color32 = Color32::from_rgb(158, 156, 150);
     pub const ACCENT: Color32 = Color32::from_rgb(232, 158, 90);
     pub const ACCENT_DIM: Color32 = Color32::from_rgb(107, 74, 43);
+}
+
+fn fmt_eta(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -524,11 +679,20 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = std::time::Instant::now();
         self.poll_torrent_handoff();
+        self.poll_pending_play();
+        self.poll_auto_select();
         ctx.request_repaint();
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Close means quit, full stop: stop playback (kills mpv/vlc), save prefs,
+            // then hard-exit so nothing can linger -- no tokio drain waits, no detached
+            // worker, no wgpu teardown limbo. The old hide-instead-of-close trick
+            // (CancelClose + Visible(false)) was unrecoverable: no tray icon, and the
+            // unhide path silently did nothing on some setups.
+            self.player.stop();
+            self.player.browsing("idle");
+            state::save_prefs(&self.prefs);
+            std::process::exit(0);
         }
         if platform::consume_show_request() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -850,12 +1014,58 @@ impl eframe::App for App {
                     for job in &active {
                         ui.horizontal(|ui| {
                             let progress = *job.progress.lock().unwrap();
+                            let indeterminate = *job.indeterminate.lock().unwrap();
                             ui.label(format!("{} · episode {}", job.anime_title, job.ep_no));
-                            ui.add(egui::ProgressBar::new(progress as f32).desired_width(120.0));
+                            let bar = egui::ProgressBar::new(progress as f32).desired_width(160.0).animate(indeterminate);
+                            let bar = if indeterminate {
+                                bar.text("locating stream…")
+                            } else {
+                                bar.text(format!("{:.0}%", progress * 100.0))
+                            };
+                            ui.add(bar);
+                            if let Some(eta) = job.eta() {
+                                ui.label(egui::RichText::new(format!("eta {}", fmt_eta(eta))).color(theme::MUTED));
+                            }
                             if ui.button("cancel").clicked() {
                                 job.cancel();
                             }
                         });
+                    }
+                    ui.separator();
+                }
+
+                let failed: Vec<Arc<download::DownloadJob>> = self
+                    .downloads
+                    .iter()
+                    .filter(|j| matches!(*j.status.lock().unwrap(), download::JobStatus::Failed | download::JobStatus::Cancelled))
+                    .cloned()
+                    .collect();
+                if !failed.is_empty() {
+                    ui.heading("failed");
+                    let mut retry: Option<Arc<download::DownloadJob>> = None;
+                    let mut dismiss: Option<Arc<download::DownloadJob>> = None;
+                    for job in &failed {
+                        let cancelled = *job.status.lock().unwrap() == download::JobStatus::Cancelled;
+                        ui.horizontal(|ui| {
+                            let label = if cancelled {
+                                format!("{} · episode {} (cancelled)", job.anime_title, job.ep_no)
+                            } else {
+                                format!("{} · episode {}", job.anime_title, job.ep_no)
+                            };
+                            ui.label(egui::RichText::new(label).color(theme::MUTED));
+                            if ui.button("retry").clicked() {
+                                retry = Some(job.clone());
+                            }
+                            if ui.button("dismiss").clicked() {
+                                dismiss = Some(job.clone());
+                            }
+                        });
+                    }
+                    if let Some(job) = retry {
+                        self.retry_download(&job);
+                    }
+                    if let Some(job) = dismiss {
+                        self.downloads.retain(|j| !Arc::ptr_eq(j, &job));
                     }
                     ui.separator();
                 }
@@ -869,10 +1079,16 @@ impl eframe::App for App {
                     ui.collapsing(&show.title, |ui| {
                         for ep in &show.episodes {
                             ui.horizontal(|ui| {
-                                ui.label(format!("episode {ep}"));
+                                let label = if ep.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                                    format!("episode {ep}")
+                                } else {
+                                    ep.clone()
+                                };
+                                ui.label(label);
                                 if ui.button("play").clicked() {
-                                    let path = download::dest_path(&show.title, ep);
-                                    self.player.play(&format!("file://{}", path.display()), &show.title, ep, None, None, "downloaded", &show.title);
+                                    if let Some(path) = download::find_episode_file(&show.title, ep) {
+                                        self.player.play(&format!("file://{}", path.display()), &show.title, ep, None, None, "downloaded", &show.title);
+                                    }
                                 }
                                 if ui.button("delete").clicked() {
                                     download::delete_episode(&show.title, ep);
@@ -1031,4 +1247,64 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App::new()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn results(titles: &[&str]) -> Vec<sources::SearchResult> {
+        titles
+            .iter()
+            .enumerate()
+            .map(|(i, t)| sources::SearchResult { id: i.to_string(), title: t.to_string() })
+            .collect()
+    }
+
+    #[test]
+    fn season_two_wants_season_two_not_the_unmarked_first_season() {
+        let r = results(&[
+            "Frieren: Beyond Journey's End",
+            "Frieren: Beyond Journey's End Season 2",
+            "Frieren: Beyond Journey's End Mini Anime",
+        ]);
+        let pick = App::best_result_match("Frieren: Beyond Journey's End Season 2", &r);
+        assert_eq!(pick.map(|p| p.title.as_str()), Some("Frieren: Beyond Journey's End Season 2"));
+    }
+
+    #[test]
+    fn markerless_want_prefers_the_unmarked_entry() {
+        let r = results(&[
+            "Frieren: Beyond Journey's End Season 2",
+            "Frieren: Beyond Journey's End",
+        ]);
+        let pick = App::best_result_match("Frieren: Beyond Journey's End", &r);
+        assert_eq!(pick.map(|p| p.title.as_str()), Some("Frieren: Beyond Journey's End"));
+    }
+
+    #[test]
+    fn roman_numeral_naming_still_matches_a_season_want() {
+        let r = results(&["Mushoku Tensei: Jobless Reincarnation", "Mushoku Tensei: Jobless Reincarnation II"]);
+        let pick = App::best_result_match("Mushoku Tensei: Jobless Reincarnation Season 2", &r);
+        assert_eq!(pick.map(|p| p.title.as_str()), Some("Mushoku Tensei: Jobless Reincarnation II"));
+    }
+
+    #[test]
+    fn wrong_season_is_never_auto_picked() {
+        let r = results(&["Frieren: Beyond Journey's End", "Frieren: Beyond Journey's End Mini Anime"]);
+        assert!(App::best_result_match("Frieren: Beyond Journey's End Season 2", &r).is_none());
+    }
+
+    #[test]
+    fn nothing_close_means_no_pick() {
+        let r = results(&["Jujutsu Kaisen", "Chainsaw Man"]);
+        assert!(App::best_result_match("Frieren: Beyond Journey's End", &r).is_none());
+    }
+
+    #[test]
+    fn nth_season_wording_is_understood() {
+        let r = results(&["Overlord", "Overlord 2nd Season"]);
+        let pick = App::best_result_match("Overlord Season 2", &r);
+        assert_eq!(pick.map(|p| p.title.as_str()), Some("Overlord 2nd Season"));
+    }
 }

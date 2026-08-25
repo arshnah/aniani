@@ -102,7 +102,7 @@ impl TorrentEngine {
         let password = stdout.and_then(|out| {
             use std::io::{BufRead, BufReader};
             let re = regex::Regex::new(r"temporary password is provided for this session:\s*(\S+)").ok()?;
-            for line in BufReader::new(out).lines().flatten() {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
                 if let Some(c) = re.captures(&line) {
                     return Some(c[1].to_string());
                 }

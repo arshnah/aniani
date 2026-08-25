@@ -1,7 +1,18 @@
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+const VIDEO_EXTS: [&str; 7] = ["mp4", "mkv", "avi", "webm", "mov", "m4v", "ts"];
+
+fn is_video_file(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| VIDEO_EXTS.iter().any(|ext| ext.eq_ignore_ascii_case(e)))
+        .unwrap_or(false)
+}
 
 fn safe(name: &str) -> String {
     name.chars().map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect::<String>().trim().to_string()
@@ -17,8 +28,27 @@ pub fn dest_path(anime_title: &str, ep_no: &str) -> PathBuf {
     show_dir.join(format!("Episode {ep_no}.mp4"))
 }
 
+fn locate_episode_file(show_dir: &Path, ep_no: &str) -> Option<PathBuf> {
+    let prefix = format!("Episode {ep_no}.");
+    let mut fallback = None;
+    for entry in std::fs::read_dir(show_dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) {
+            return Some(entry.path());
+        }
+        if is_video_file(&name) && Path::new(&name).file_stem().map(|s| s.to_string_lossy()) == Some(ep_no.into()) {
+            fallback = Some(entry.path());
+        }
+    }
+    fallback
+}
+
+pub fn find_episode_file(anime_title: &str, ep_no: &str) -> Option<PathBuf> {
+    locate_episode_file(&download_root().join(safe(anime_title)), ep_no)
+}
+
 pub fn is_downloaded(anime_title: &str, ep_no: &str) -> bool {
-    dest_path(anime_title, ep_no).exists()
+    find_episode_file(anime_title, ep_no).is_some()
 }
 
 #[derive(Clone)]
@@ -40,7 +70,16 @@ pub fn list_downloaded() -> Vec<DownloadedShow> {
             let mut episodes: Vec<String> = std::fs::read_dir(e.path())
                 .ok()?
                 .flatten()
-                .filter_map(|f| ep_re.captures(&f.file_name().to_string_lossy()).map(|c| c[1].to_string()))
+                .filter_map(|f| {
+                    let name = f.file_name().to_string_lossy().to_string();
+                    if let Some(c) = ep_re.captures(&name) {
+                        return Some(c[1].to_string());
+                    }
+                    if is_video_file(&name) {
+                        return Some(Path::new(&name).file_stem()?.to_string_lossy().to_string());
+                    }
+                    None
+                })
                 .collect();
             if episodes.is_empty() {
                 return None;
@@ -55,13 +94,8 @@ pub fn list_downloaded() -> Vec<DownloadedShow> {
 
 pub fn delete_episode(anime_title: &str, ep_no: &str) {
     let show_dir = download_root().join(safe(anime_title));
-    let prefix = format!("Episode {ep_no}.");
-    if let Ok(entries) = std::fs::read_dir(&show_dir) {
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
+    if let Some(path) = locate_episode_file(&show_dir, ep_no) {
+        let _ = std::fs::remove_file(path);
     }
     if std::fs::read_dir(&show_dir).map(|mut d| d.next().is_none()).unwrap_or(false) {
         let _ = std::fs::remove_dir(&show_dir);
@@ -80,26 +114,39 @@ pub enum JobStatus {
 pub struct DownloadJob {
     pub anime_title: String,
     pub ep_no: String,
-    pub url: String,
-    pub referer: Option<String>,
+    pub ep_ref: String,
     pub dest: PathBuf,
     pub status: Mutex<JobStatus>,
     pub progress: Mutex<f64>,
+    pub indeterminate: Mutex<bool>,
+    pub started: Mutex<Option<Instant>>,
     proc: Mutex<Option<Child>>,
 }
 
 impl DownloadJob {
-    pub fn new(anime_title: &str, ep_no: &str, url: &str, referer: Option<String>) -> Arc<Self> {
+    pub fn new(anime_title: &str, ep_no: &str, ep_ref: &str) -> Arc<Self> {
         Arc::new(DownloadJob {
             anime_title: anime_title.to_string(),
             ep_no: ep_no.to_string(),
-            url: url.to_string(),
-            referer,
+            ep_ref: ep_ref.to_string(),
             dest: dest_path(anime_title, ep_no),
             status: Mutex::new(JobStatus::Queued),
             progress: Mutex::new(0.0),
+            indeterminate: Mutex::new(true),
+            started: Mutex::new(None),
             proc: Mutex::new(None),
         })
+    }
+
+    pub fn eta(&self) -> Option<std::time::Duration> {
+        let started = (*self.started.lock().unwrap())?;
+        let progress = *self.progress.lock().unwrap();
+        if progress <= 0.01 {
+            return None;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let total = elapsed / progress;
+        Some(std::time::Duration::from_secs_f64((total - elapsed).max(0.0)))
     }
 
     pub fn cancel(&self) {
@@ -114,17 +161,40 @@ impl DownloadJob {
     }
 }
 
-pub fn run_job(job: &Arc<DownloadJob>) {
-    *job.status.lock().unwrap() = JobStatus::Downloading;
+fn tool_path(name: &str) -> String {
+    which::which(name).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| name.into())
+}
 
-    let ffmpeg = which::which("ffmpeg").map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| "ffmpeg".into());
-    let mut cmd = Command::new(ffmpeg);
-    cmd.args(["-y", "-loglevel", "info", "-stats"]);
-    if let Some(referer) = &job.referer {
+fn probe_duration(url: &str, referer: &Option<String>) -> Option<f64> {
+    let mut cmd = Command::new(tool_path("ffprobe"));
+    cmd.args(["-v", "error"]);
+    if let Some(referer) = referer {
         cmd.args(["-headers", &format!("Referer: {referer}\r\n")]);
     }
     cmd.args(["-extension_picky", "0", "-allowed_segment_extensions", "ALL"]);
-    cmd.args(["-i", &job.url, "-c", "copy"]).arg(&job.dest);
+    cmd.args(["-show_entries", "format=duration", "-of", "csv=p=0", url]);
+    let out = cmd.output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok().filter(|d| *d > 0.0)
+}
+
+pub fn run_job(job: &Arc<DownloadJob>) {
+    *job.status.lock().unwrap() = JobStatus::Downloading;
+
+    let Ok(Some(link)) = crate::sources::anidb_watch(&job.ep_ref, false) else {
+        *job.status.lock().unwrap() = JobStatus::Failed;
+        return;
+    };
+
+    let duration = probe_duration(&link.url, &link.referer);
+    *job.indeterminate.lock().unwrap() = duration.is_none();
+
+    let mut cmd = Command::new(tool_path("ffmpeg"));
+    cmd.args(["-y", "-loglevel", "error"]);
+    if let Some(referer) = &link.referer {
+        cmd.args(["-headers", &format!("Referer: {referer}\r\n")]);
+    }
+    cmd.args(["-extension_picky", "0", "-allowed_segment_extensions", "ALL"]);
+    cmd.args(["-i", &link.url, "-c", "copy", "-progress", "pipe:1", "-nostats"]).arg(&job.dest);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut proc = match cmd.spawn() {
@@ -135,21 +205,27 @@ pub fn run_job(job: &Arc<DownloadJob>) {
         }
     };
     let stdout = proc.stdout.take();
+    let stderr = proc.stderr.take();
     *job.proc.lock().unwrap() = Some(proc);
+    *job.started.lock().unwrap() = Some(Instant::now());
+
+    if let Some(stderr) = stderr {
+        std::thread::spawn(move || {
+            let mut discard = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut discard);
+        });
+    }
 
     if let Some(stdout) = stdout {
-        let mut duration: Option<i64> = None;
-        let dur_re = regex::Regex::new(r"Duration: (\d+):(\d+):(\d+)").unwrap();
-        let time_re = regex::Regex::new(r"time=(\d+):(\d+):(\d+)").unwrap();
-        for line in BufReader::new(stdout).lines().flatten() {
-            if duration.is_none() {
-                if let Some(c) = dur_re.captures(&line) {
-                    duration = Some(hms(&c));
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<i64>().ok()) {
+                if let Some(d) = duration {
+                    *job.progress.lock().unwrap() = ((us as f64 / 1_000_000.0) / d).clamp(0.0, 1.0);
                 }
-            }
-            if let (Some(d), Some(c)) = (duration, time_re.captures(&line)) {
-                if d > 0 {
-                    *job.progress.lock().unwrap() = (hms(&c) as f64 / d as f64).min(1.0);
+            } else if line.trim() == "progress=end" {
+                *job.indeterminate.lock().unwrap() = false;
+                if duration.is_some() {
+                    *job.progress.lock().unwrap() = 1.0;
                 }
             }
         }
@@ -164,16 +240,10 @@ pub fn run_job(job: &Arc<DownloadJob>) {
         let _ = std::fs::remove_file(&job.dest);
     } else if status.map(|s| s.success()).unwrap_or(false) && job.dest.exists() {
         *job_status = JobStatus::Done;
+        *job.indeterminate.lock().unwrap() = false;
         *job.progress.lock().unwrap() = 1.0;
     } else {
         *job_status = JobStatus::Failed;
         let _ = std::fs::remove_file(&job.dest);
     }
-}
-
-fn hms(c: &regex::Captures) -> i64 {
-    let h: i64 = c[1].parse().unwrap_or(0);
-    let m: i64 = c[2].parse().unwrap_or(0);
-    let s: i64 = c[3].parse().unwrap_or(0);
-    h * 3600 + m * 60 + s
 }

@@ -11,6 +11,28 @@ This is a full rewrite, not a port. The old Python/PyQt6 version is
 still on the `main` branch if you want it; this branch replaces it
 going forward.
 
+## Install
+
+Grab the latest build from [Releases](https://github.com/arshnah/aniani/releases/latest):
+
+- **Windows** -- download `aniani.exe`, drop it wherever, run it.
+- **Linux** -- download `aniani-linux-x86_64.tar.gz`, then:
+  ```
+  tar -xzf aniani-linux-x86_64.tar.gz
+  chmod +x aniani
+  ./aniani
+  ```
+
+Either way you'll also want the runtime tools in [Setup](#setup) on
+PATH (`mpv`/`vlc`, `ffmpeg`, `curl_chrome136`, `qbittorrent-nox`) --
+aniani itself is a single binary, no installer needed. Building from
+source instead:
+```
+git clone --branch rust-remake https://github.com/arshnah/aniani.git
+cd aniani
+cargo build --release
+```
+
 ## Why the rewrite
 
 The Python version's dashboard has to decode 25+ anime cover jpegs
@@ -63,10 +85,14 @@ Switchable from the top bar at any time.
 ## Downloads / offline
 
 ffmpeg remuxes HLS to mp4 (same approach `ani-cli` itself uses for
-`-d`/`--download`), progress parsed off ffmpeg's own stderr,
-cancellable. A Downloads tab shows in-progress jobs and a browsable
+`-d`/`--download`). Total duration is fetched up front with `ffprobe`
+and live progress comes off `ffmpeg -progress pipe:1`, so the bar
+reflects real percent/ETA instead of guessing, and downloads are
+cancellable. A Downloads tab shows in-progress jobs with a percent +
+ETA readout, a failed/cancelled section with retry, and a browsable
 library of what's already saved, playable with no source or network
-needed at all.
+needed at all -- including video files dropped into a show's folder
+by some other source, not just ones aniani itself downloaded.
 
 ## AniList tracker sync
 
@@ -96,17 +122,15 @@ of its documented outages. Clicking a continue-watching card checks if
 that episode is already downloaded and plays it straight from disk if
 so, instead of re-resolving a live stream.
 
-## Closing the window / running in the background
+## Closing the window
 
-Closing the window hides it instead of quitting -- Discord presence and
-playback keep running. Launching `aniani`/`aniani.exe` again while it's
-already running doesn't open a second window, it just un-hides and
-focuses the existing one (an `fd-lock`-based single-instance lock plus
-a signal file, checked in `platform.rs`/`main.rs`). This is not a real
-system tray icon -- there's no click-to-restore from a tray area, the
-only way back in right now is relaunching the exe. A proper tray icon
-would need the `tray-icon` crate wired into eframe's own winit event
-loop, a bigger integration not attempted here.
+Closing means quit, full stop: playback is stopped (mpv/vlc killed, no
+orphans), prefs are saved, then the process exits for real -- no
+hide-in-background trick, no tray icon to restore from. Launching
+`aniani`/`aniani.exe` again while it's already running doesn't open a
+second window though -- an `fd-lock`-based single-instance lock plus a
+signal file (checked in `platform.rs`/`main.rs`) makes the new launch
+just focus the existing instance and exit.
 
 ## VLC window-close handling (Linux/Hyprland)
 

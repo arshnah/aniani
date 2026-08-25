@@ -147,6 +147,15 @@ impl MpvPlayer {
             let _ = p.wait();
         }
     }
+
+    /// True when the mpv process we spawned has exited on its own (playback finished or
+    /// the user quit it), as opposed to still running.
+    pub fn has_exited(&mut self) -> bool {
+        match &mut self.proc {
+            Some(p) => matches!(p.try_wait(), Ok(Some(_))),
+            None => false,
+        }
+    }
 }
 
 impl Drop for MpvPlayer {
@@ -165,10 +174,28 @@ pub struct VlcPlayer {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .unwrap_or(9091)
+    for _ in 0..5 {
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else { break };
+        let Ok(addr) = listener.local_addr() else { break };
+        let port = addr.port();
+        drop(listener);
+        // Narrow the bind-then-spawn race: the port must refuse connections right up
+        // until VLC binds it. If something grabbed it in between, try another.
+        if std::net::TcpStream::connect(addr).is_err() {
+            return port;
+        }
+    }
+    9091
+}
+
+#[cfg(target_os = "linux")]
+fn adopted_vlc_alive(pid: u32) -> bool {
+    platform::pid_cmdline_contains(pid, "vlc")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn adopted_vlc_alive(_pid: u32) -> bool {
+    false
 }
 
 fn vlc_port_path() -> std::path::PathBuf {
@@ -185,12 +212,27 @@ fn vlc_password_path() -> std::path::PathBuf {
 
 impl VlcPlayer {
     pub fn new() -> Self {
-        let shared_port = std::fs::read_to_string(vlc_port_path()).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(9091);
-        let shared_pid = std::fs::read_to_string(vlc_pid_path()).ok().and_then(|s| s.trim().parse().ok());
-        let shared_password = std::fs::read_to_string(vlc_password_path()).ok().unwrap_or_default();
+        // Only adopt a previous session's VLC if its pid is still alive and actually
+        // points at a vlc process; stale files from a crash or a recycled pid would
+        // otherwise make a dead player look running.
+        let shared_pid = std::fs::read_to_string(vlc_pid_path())
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|&pid| adopted_vlc_alive(pid));
+        let adopt = shared_pid.is_some();
+        let shared_port = if adopt {
+            std::fs::read_to_string(vlc_port_path()).ok().and_then(|s| s.trim().parse().ok())
+        } else {
+            None
+        };
+        let shared_password = if adopt {
+            std::fs::read_to_string(vlc_password_path()).ok().unwrap_or_default()
+        } else {
+            String::new()
+        };
         VlcPlayer {
             proc: None,
-            port: shared_port,
+            port: shared_port.unwrap_or(9091),
             password: shared_password,
             client: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_millis(1500))
@@ -199,6 +241,12 @@ impl VlcPlayer {
             shared_pid,
             window_ever_seen: false,
         }
+    }
+
+    fn clear_shared_state() {
+        let _ = std::fs::remove_file(vlc_port_path());
+        let _ = std::fs::remove_file(vlc_pid_path());
+        let _ = std::fs::remove_file(vlc_password_path());
     }
 
     fn base_url(&self) -> String {
@@ -212,11 +260,35 @@ impl VlcPlayer {
                 #[cfg(target_os = "linux")]
                 {
                     self.shared_pid
-                        .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+                        .map(|pid| platform::pid_cmdline_contains(pid, "vlc"))
                         .unwrap_or(false)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
+                    false
+                }
+            }
+        }
+    }
+
+    /// True when the player we know about has exited on its own (playback finished, or
+    /// the user quit it directly), as opposed to still running. Lets the worker clear
+    /// now_playing instead of showing a ghost bar forever.
+    pub fn has_exited(&mut self) -> bool {
+        match &mut self.proc {
+            Some(p) => matches!(p.try_wait(), Ok(Some(_))),
+            None => {
+                if let Some(pid) = self.shared_pid {
+                    #[cfg(target_os = "linux")]
+                    {
+                        !platform::pid_cmdline_contains(pid, "vlc")
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = pid;
+                        false
+                    }
+                } else {
                     false
                 }
             }
@@ -243,8 +315,8 @@ impl VlcPlayer {
         self.window_ever_seen = false;
         self.port = free_port();
         self.password = format!("{:032x}", rand::random::<u128>());
-        let _ = std::fs::write(vlc_port_path(), self.port.to_string());
-        let _ = std::fs::write(vlc_password_path(), &self.password);
+        platform::write_private(&vlc_port_path(), &self.port.to_string());
+        platform::write_private(&vlc_password_path(), &self.password);
 
         let vlc_bin = platform::find_vlc().unwrap_or_else(|| "vlc".to_string());
         let mut cmd = Command::new(vlc_bin);
@@ -269,7 +341,7 @@ impl VlcPlayer {
         self.proc = cmd.spawn().ok();
         self.shared_pid = self.proc.as_ref().map(|p| p.id());
         if let Some(pid) = self.shared_pid {
-            let _ = std::fs::write(vlc_pid_path(), pid.to_string());
+            platform::write_private(&vlc_pid_path(), &pid.to_string());
         }
     }
 
@@ -325,8 +397,11 @@ impl VlcPlayer {
         if let Some(mut p) = self.proc.take() {
             let _ = p.kill();
             let _ = p.wait();
+            // We owned the player these files describe; nothing left to adopt.
+            Self::clear_shared_state();
         } else if let Some(pid) = self.shared_pid.take() {
             let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            Self::clear_shared_state();
         }
     }
 }
@@ -393,6 +468,12 @@ impl Backend {
         match self {
             Backend::Vlc(p) => p.window_gone(),
             Backend::Mpv(_) => false,
+        }
+    }
+    pub fn has_exited(&mut self) -> bool {
+        match self {
+            Backend::Vlc(p) => p.has_exited(),
+            Backend::Mpv(p) => p.has_exited(),
         }
     }
     pub fn stop(&mut self) {

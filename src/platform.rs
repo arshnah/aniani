@@ -95,7 +95,14 @@ pub fn debug_log(msg: &str) {
 pub fn acquire_single_instance_lock() -> bool {
     let _ = std::fs::create_dir_all(state_dir("aniani"));
     let path = state_dir("aniani").join("aniani.lock");
-    let Ok(file) = std::fs::OpenOptions::new().create(true).write(true).open(path) else { return false };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // lock file only needs to exist; contents are irrelevant
+        .open(path)
+    else {
+        return false;
+    };
     let lock: &'static mut fd_lock::RwLock<std::fs::File> = Box::leak(Box::new(fd_lock::RwLock::new(file)));
     match lock.try_write() {
         Ok(guard) => {
@@ -125,16 +132,51 @@ pub fn consume_show_request() -> bool {
     }
 }
 
+/// True when a client whose pid matches `pid` (or, when no pid is known, whose class
+/// matches) exists. Matching by class alone is a fallback: any unrelated window of the
+/// same app would otherwise mask or fake the answer.
 pub fn hyprland_window_exists(window_class: &str, pid: Option<u32>) -> Option<bool> {
     let hyprctl = which::which("hyprctl").ok()?;
     let out = std::process::Command::new(hyprctl).args(["clients", "-j"]).output().ok()?;
     let clients: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let arr = clients.as_array()?;
-    Some(arr.iter().any(|c| {
-        let class_match = c.get("class").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case(window_class)).unwrap_or(false);
-        let pid_match = pid.is_some() && c.get("pid").and_then(|v| v.as_u64()) == pid.map(|p| p as u64);
-        class_match || pid_match
+    Some(arr.iter().any(|c| match pid {
+        Some(p) => c.get("pid").and_then(|v| v.as_u64()) == Some(p as u64),
+        None => c
+            .get("class")
+            .and_then(|v| v.as_str())
+            .map(|s| s.eq_ignore_ascii_case(window_class))
+            .unwrap_or(false),
     }))
+}
+
+/// Writes a file readable only by the current user on Unix; plain write elsewhere.
+pub fn write_private(path: &std::path::Path, contents: &str) {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| f.write_all(contents.as_bytes()));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, contents);
+    }
+}
+
+/// Linux only: true if /proc/{pid} exists and its cmdline actually mentions `needle`.
+/// Guards against PID reuse making a dead player look alive.
+#[cfg(target_os = "linux")]
+pub fn pid_cmdline_contains(pid: u32, needle: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .map(|cmdline| cmdline.replace('\0', " ").contains(needle))
+        .unwrap_or(false)
 }
 
 pub fn find_curl_impersonate() -> Option<String> {

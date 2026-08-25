@@ -16,18 +16,21 @@ shown as its own row on the discover tab (click one to jump to
 search). no in-app editing of anilist entries beyond what playing an
 episode already pushes.
 
-system tray / minimize instead of quit: done, but honestly scoped down
-from a real tray icon. closing the window now hides it instead of
-quitting (close_requested -> CancelClose + Visible(false)), so discord
-presence and the worker thread keep running in the background. an
-fd-lock-based single-instance lock means launching the exe again while
-it's already running doesn't spawn a second process -- it writes a
-"show" signal file and exits immediately, and the original instance
-picks that up and un-hides + focuses itself. no actual system tray
-icon (no click-to-restore from the taskbar tray area) -- that needs
-the `tray-icon` crate wired into eframe's own winit event loop, which
-is a bigger, riskier integration i didn't attempt. right now the only
-way back in is relaunching the exe.
+system tray / minimize instead of quit: reworked. the old approach --
+close_requested -> CancelClose + Visible(false) so the app "goes to
+background" -- turned out to be a trap in practice: no tray icon to
+come back with, the relaunch-to-unhide signal silently did nothing on
+at least one hyprland setup, and closing the window (x or super+q)
+appeared to do nothing at all, leaving a zombie process with discord
+presence stuck. close now means quit: playback is stopped (mpv/vlc
+killed, no orphans), prefs are saved through on_exit, and the event
+loop exits for real. the fd-lock single-instance behavior is unchanged
+and still useful: launching the exe while it's running writes a "show"
+signal and exits, and the running instance focuses itself. a real
+tray icon (close-to-tray done properly, with click-to-restore) would
+need the `tray-icon` crate wired into eframe's winit event loop --
+still not attempted, and only worth it if background playback with a
+visible restore affordance is actually wanted.
 
 macos: still completely untouched, no testing, no binary-discovery
 fallback paths added for /Applications.
@@ -45,3 +48,38 @@ VlcPlayer::new() now reads the shared port/pid/password files a
 previous run wrote, instead of always starting from a blank slate.
 windows/macos get none of this -- hyprctl doesn't exist there, so
 window_gone() always returns false (safe default, not "broken").
+
+player lifecycle hardening pass: natural end-of-playback used to leave
+ghosts -- vlc with -I dummy exits when the playlist finishes and mpv
+exits on quit, but nothing watched for that, so the bottom player bar
+stuck around with no status and discord presence froze on the last
+watching frame. the worker now checks backend.has_exited() every tick
+(child process reaped for both backends, /proc cmdline check for an
+adopted vlc) and tears down now_playing/status/presence the same way
+window_gone() does -- which also means window-close cleanup now works
+on every platform, since closing the window exits the process anyway.
+adoption got paranoid too: a stale pid file only counts if /proc/{pid}
+actually contains a vlc process (guards against pid reuse after a
+crash), the shared port/password/pid files are written 0600 instead of
+world-readable, they're deleted when the owning player stops, and
+hyprland window matching is pid-first so an unrelated vlc window
+somewhere else can't mask or fake the answer. also: free_port()
+re-checks the port is actually refusing connections before handing it
+to vlc, and the single-instance lock file opens with explicit
+truncate(false).
+
+seamless discover -> episodes: clicking watch on a discover card (or
+continue-watching falling back to search) no longer dumps you at a
+results list to hand-pick from. open_in_search() records the wanted
+title, and once the anidb results land, poll_auto_select() picks the
+best normalized-title match and loads its episodes directly. the
+matcher is season-aware: sequels are separate entries on anilist and
+anidb but named inconsistently ("season 2" vs "2nd season" vs "II"),
+so it splits the season marker off each title before comparing and
+only auto-picks when both sides agree on the season -- wanting season
+2 never silently lands you in season 1, and a marker-less want never
+grabs an explicit sequel. nothing close enough means the manual list
+stays. a manual re-search cancels any pending auto-select, and stale
+results are cleared the moment a new search starts so the poll can't
+fire on the previous search's output. covered by unit tests (cargo
+test --bin aniani).
