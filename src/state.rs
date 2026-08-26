@@ -50,6 +50,12 @@ pub fn update_history(source: &str, anime_id: &str, anime_title: &str, ep_no: &s
     save(&state_dir().join("history.json"), &entries);
 }
 
+pub fn remove_history(anime_title: &str) {
+    let mut entries = read_history();
+    entries.retain(|e| e.anime_title != anime_title);
+    save(&state_dir().join("history.json"), &entries);
+}
+
 pub fn position_key(source: &str, anime_title: &str, ep_no: &str) -> String {
     format!("{source}::{anime_title}::{ep_no}")
 }

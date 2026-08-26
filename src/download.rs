@@ -28,6 +28,15 @@ pub fn dest_path(anime_title: &str, ep_no: &str) -> PathBuf {
     show_dir.join(format!("Episode {ep_no}.mp4"))
 }
 
+pub fn import_file(anime_title: &str, ep_label: &str, src: &Path) -> std::io::Result<()> {
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+    let show_dir = download_root().join(safe(anime_title));
+    std::fs::create_dir_all(&show_dir)?;
+    let dest = show_dir.join(format!("{}.{ext}", safe(ep_label)));
+    std::fs::copy(src, dest)?;
+    Ok(())
+}
+
 fn locate_episode_file(show_dir: &Path, ep_no: &str) -> Option<PathBuf> {
     let prefix = format!("Episode {ep_no}.");
     let mut fallback = None;

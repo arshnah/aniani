@@ -53,6 +53,13 @@ struct PendingPlay {
     canonical: i64,
 }
 
+#[derive(Default)]
+struct GridActions {
+    clicked: Option<sources::Anime>,
+    browse: Option<sources::Anime>,
+    remove: Option<sources::Anime>,
+}
+
 struct App {
     rt: tokio::runtime::Runtime,
     http: reqwest::Client,
@@ -65,6 +72,7 @@ struct App {
     search_query: String,
     search_source: SearchSource,
     anidb_results: Arc<Mutex<Vec<sources::SearchResult>>>,
+    searching: Arc<Mutex<bool>>,
     /// When set, the next anidb search results should be matched against this title and
     /// the best match auto-selected, skipping the manual result pick (discover -> watch).
     auto_select: Option<String>,
@@ -88,6 +96,9 @@ struct App {
 
     downloads: Vec<Arc<download::DownloadJob>>,
     downloaded_library: Arc<Mutex<Vec<download::DownloadedShow>>>,
+    pending_import: Arc<Mutex<Option<std::path::PathBuf>>>,
+    import_title: String,
+    import_ep_label: String,
     seek_drag: Option<f64>,
     update_available: Arc<Mutex<Option<String>>>,
     anime_detail: Option<sources::Anime>,
@@ -118,6 +129,7 @@ impl App {
             search_query: String::new(),
             search_source: SearchSource::AniDb,
             anidb_results: Arc::new(Mutex::new(vec![])),
+            searching: Arc::new(Mutex::new(false)),
             auto_select: None,
             yuma_results: Arc::new(Mutex::new(vec![])),
             nyaa_results: Arc::new(Mutex::new(vec![])),
@@ -134,6 +146,9 @@ impl App {
             pending_play: Arc::new(Mutex::new(None)),
             downloads: vec![],
             downloaded_library: Arc::new(Mutex::new(vec![])),
+            pending_import: Arc::new(Mutex::new(None)),
+            import_title: String::new(),
+            import_ep_label: String::new(),
             seek_drag: None,
             update_available: Arc::new(Mutex::new(None)),
             anime_detail: None,
@@ -228,31 +243,42 @@ impl App {
             SearchSource::Yuma => self.yuma_results.lock().unwrap().clear(),
             SearchSource::Nyaa => self.nyaa_results.lock().unwrap().clear(),
         }
+        *self.searching.lock().unwrap() = true;
         match self.search_source {
             SearchSource::AniDb => {
                 let q = self.search_query.clone();
                 let out = self.anidb_results.clone();
-                std::thread::spawn(move || match sources::anidb_search(&q) {
-                    Ok(v) => *out.lock().unwrap() = v,
-                    Err(e) => platform::debug_log(&format!("anidb_search({q}) failed: {e}")),
+                let searching = self.searching.clone();
+                std::thread::spawn(move || {
+                    match sources::anidb_search(&q) {
+                        Ok(v) => *out.lock().unwrap() = v,
+                        Err(e) => platform::debug_log(&format!("anidb_search({q}) failed: {e}")),
+                    }
+                    *searching.lock().unwrap() = false;
                 });
             }
             SearchSource::Yuma => {
                 let q = self.search_query.clone();
                 let out = self.yuma_results.clone();
-                std::thread::spawn(move || match yuma::search(&q) {
-                    Ok(v) => *out.lock().unwrap() = v,
-                    Err(e) => platform::debug_log(&format!("yuma::search({q}) failed: {e}")),
+                let searching = self.searching.clone();
+                std::thread::spawn(move || {
+                    match yuma::search(&q) {
+                        Ok(v) => *out.lock().unwrap() = v,
+                        Err(e) => platform::debug_log(&format!("yuma::search({q}) failed: {e}")),
+                    }
+                    *searching.lock().unwrap() = false;
                 });
             }
             SearchSource::Nyaa => {
                 let q = self.search_query.clone();
                 let client = self.http.clone();
                 let out = self.nyaa_results.clone();
+                let searching = self.searching.clone();
                 self.rt.spawn(async move {
                     if let Ok(v) = torrent::nyaa_search(&client, &q).await {
                         *out.lock().unwrap() = v;
                     }
+                    *searching.lock().unwrap() = false;
                 });
             }
         }
@@ -418,10 +444,15 @@ impl App {
     }
 
     fn anime_grid(&self, ui: &mut egui::Ui, id_salt: &str, list: &[sources::Anime]) -> Option<sources::Anime> {
-        let mut clicked = None;
+        self.anime_grid_with_actions(ui, id_salt, list, false).clicked
+    }
+
+    fn anime_grid_with_actions(&self, ui: &mut egui::Ui, id_salt: &str, list: &[sources::Anime], show_actions: bool) -> GridActions {
+        let mut actions = GridActions::default();
         egui::ScrollArea::horizontal().id_salt(id_salt).show(ui, |ui| {
             ui.horizontal(|ui| {
                 for anime in list {
+                    let mut action_taken = false;
                     let frame = egui::Frame::none()
                         .fill(theme::SURFACE)
                         .rounding(10.0)
@@ -446,6 +477,18 @@ impl App {
                                         egui::RichText::new(format!("★ {score}% rated")).size(12.0).color(theme::MUTED),
                                     );
                                 }
+                                if show_actions {
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("episodes").clicked() {
+                                            actions.browse = Some(anime.clone());
+                                            action_taken = true;
+                                        }
+                                        if ui.small_button("remove").clicked() {
+                                            actions.remove = Some(anime.clone());
+                                            action_taken = true;
+                                        }
+                                    });
+                                }
                             });
                         });
                     let resp = frame.response.interact(egui::Sense::click());
@@ -454,13 +497,13 @@ impl App {
                     } else {
                         anime.description.clone()
                     });
-                    if resp.clicked() {
-                        clicked = Some(anime.clone());
+                    if resp.clicked() && !action_taken {
+                        actions.clicked = Some(anime.clone());
                     }
                 }
             });
         });
-        clicked
+        actions
     }
 
     fn open_in_search(&mut self, title: &str) {
@@ -851,13 +894,11 @@ impl eframe::App for App {
                 }
 
                 let mut clicked = None;
-                let mut continue_watching_clicked = None;
+                let mut continue_watching_actions = GridActions::default();
                 let continue_watching = self.continue_watching.lock().unwrap().clone();
                 if !continue_watching.is_empty() {
                     ui.heading("continue watching");
-                    if let Some(t) = self.anime_grid(ui, "continue_watching", &continue_watching) {
-                        continue_watching_clicked = Some(t);
-                    }
+                    continue_watching_actions = self.anime_grid_with_actions(ui, "continue_watching", &continue_watching, true);
                     ui.add_space(12.0);
                 }
                 ui.heading("trending");
@@ -872,8 +913,15 @@ impl eframe::App for App {
                     clicked = Some(t);
                 }
                 ui.add_space(20.0);
-                if let Some(anime) = continue_watching_clicked {
+                if let Some(anime) = continue_watching_actions.clicked {
                     self.resume_continue_watching(&anime.title);
+                }
+                if let Some(anime) = continue_watching_actions.browse {
+                    self.open_in_search(&anime.title);
+                }
+                if let Some(anime) = continue_watching_actions.remove {
+                    state::remove_history(&anime.title);
+                    self.refresh_continue_watching();
                 }
                 if let Some(anime) = clicked {
                     self.anime_detail = Some(anime);
@@ -917,9 +965,16 @@ impl eframe::App for App {
                 });
                 ui.separator();
 
+                if *self.searching.lock().unwrap() {
+                    ui.label(egui::RichText::new("searching…").color(theme::MUTED));
+                }
+
                 match self.search_source {
                     SearchSource::AniDb => {
                         let results = self.anidb_results.lock().unwrap().clone();
+                        if results.is_empty() && !*self.searching.lock().unwrap() && !self.search_query.trim().is_empty() {
+                            ui.label(egui::RichText::new("no results. check debug.log if this keeps happening.").color(theme::MUTED));
+                        }
                         for r in &results {
                             if ui.selectable_label(false, &r.title).clicked() {
                                 self.select_anime(&r.id, &r.title, StreamSource::AniDb);
@@ -1003,6 +1058,46 @@ impl eframe::App for App {
                 }
             }
             Tab::Downloads => {
+                if ui.button("import existing file…").clicked() {
+                    let pending = self.pending_import.clone();
+                    std::thread::spawn(move || {
+                        if let Some(path) = rfd::FileDialog::new().add_filter("video", &["mp4", "mkv", "avi", "webm", "mov", "m4v", "ts"]).pick_file() {
+                            *pending.lock().unwrap() = Some(path);
+                        }
+                    });
+                }
+                let picked = self.pending_import.lock().unwrap().clone();
+                if let Some(path) = &picked {
+                    ui.group(|ui| {
+                        ui.label(format!("importing: {}", path.display()));
+                        ui.horizontal(|ui| {
+                            ui.label("show title");
+                            ui.text_edit_singleline(&mut self.import_title);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("episode label");
+                            ui.text_edit_singleline(&mut self.import_ep_label);
+                        });
+                        ui.horizontal(|ui| {
+                            let ready = !self.import_title.trim().is_empty() && !self.import_ep_label.trim().is_empty();
+                            if ui.add_enabled(ready, egui::Button::new("add to library")).clicked() {
+                                if download::import_file(self.import_title.trim(), self.import_ep_label.trim(), path).is_ok() {
+                                    self.refresh_downloaded_library();
+                                }
+                                *self.pending_import.lock().unwrap() = None;
+                                self.import_title.clear();
+                                self.import_ep_label.clear();
+                            }
+                            if ui.button("cancel").clicked() {
+                                *self.pending_import.lock().unwrap() = None;
+                                self.import_title.clear();
+                                self.import_ep_label.clear();
+                            }
+                        });
+                    });
+                }
+                ui.separator();
+
                 let active: Vec<Arc<download::DownloadJob>> = self
                     .downloads
                     .iter()

@@ -24,6 +24,7 @@ which = "6"
 discord-rich-presence = "0.2"
 regex = "1"
 fd-lock = "4"
+rfd = "0.17.2"
 
 [profile.release]
 opt-level = 3
