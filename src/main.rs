@@ -73,6 +73,7 @@ struct App {
     search_source: SearchSource,
     anidb_results: Arc<Mutex<Vec<sources::SearchResult>>>,
     searching: Arc<Mutex<bool>>,
+    search_dirty_at: Option<std::time::Instant>,
     /// When set, the next anidb search results should be matched against this title and
     /// the best match auto-selected, skipping the manual result pick (discover -> watch).
     auto_select: Option<String>,
@@ -130,6 +131,7 @@ impl App {
             search_source: SearchSource::AniDb,
             anidb_results: Arc::new(Mutex::new(vec![])),
             searching: Arc::new(Mutex::new(false)),
+            search_dirty_at: None,
             auto_select: None,
             yuma_results: Arc::new(Mutex::new(vec![])),
             nyaa_results: Arc::new(Mutex::new(vec![])),
@@ -231,6 +233,17 @@ impl App {
             let list = tracker::my_list(&client).await;
             *out.lock().unwrap() = list;
         });
+    }
+
+    fn poll_debounced_search(&mut self) {
+        let Some(dirty_at) = self.search_dirty_at else { return };
+        if dirty_at.elapsed() < Duration::from_millis(400) {
+            return;
+        }
+        self.search_dirty_at = None;
+        if !self.search_query.trim().is_empty() {
+            self.run_search();
+        }
     }
 
     fn run_search(&mut self) {
@@ -724,6 +737,7 @@ impl eframe::App for App {
         self.poll_torrent_handoff();
         self.poll_pending_play();
         self.poll_auto_select();
+        self.poll_debounced_search();
         ctx.request_repaint();
 
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -953,14 +967,23 @@ impl eframe::App for App {
             }
             Tab::Search => {
                 ui.horizontal(|ui| {
+                    let source_before = self.search_source;
                     ui.selectable_value(&mut self.search_source, SearchSource::AniDb, "anidb (stream)");
                     ui.selectable_value(&mut self.search_source, SearchSource::Yuma, "aniwatch (stream, search only)");
                     ui.selectable_value(&mut self.search_source, SearchSource::Nyaa, "nyaa (torrent)");
+                    if self.search_source != source_before && !self.search_query.trim().is_empty() {
+                        self.run_search();
+                    }
                 });
                 ui.horizontal(|ui| {
                     let resp = ui.text_edit_singleline(&mut self.search_query);
-                    if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || ui.button("search").clicked() {
+                    if resp.changed() {
+                        self.search_dirty_at = Some(std::time::Instant::now());
+                    }
+                    let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if enter_pressed || ui.button("search").clicked() {
                         self.run_search();
+                        self.search_dirty_at = None;
                     }
                 });
                 ui.separator();
