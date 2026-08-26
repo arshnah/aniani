@@ -8,7 +8,15 @@ itself). still only tested on a couple of machines, not broad
 hardware/driver coverage.
 
 yuma (aniwatchtv.to) stream resolution: search() and episodes() work,
-watch() is not implemented and there are no plans to add it.
+watch() is not implemented and there are no plans to add it. Looked into
+wiring it up properly (aniwatchtv is a HiAnime/megacloud-family site,
+same embed scheme as hianime.to/aniwatch.to/zoro.to): the canonical
+open-source reference implementation for that extraction, ghoshRitesh12's
+aniwatch / aniwatch-api, is DMCA-blocked on GitHub as of March 2026
+following a Crunchyroll takedown -- that's specifically about extracting
+playable stream URLs from a site serving unlicensed Crunchyroll content.
+Decided not to reimplement it here given that precedent. Search and
+episode listing (metadata only, no stream extraction) stay as they are.
 
 anilist tracker: two-way now. whoami/connect/sync-toggle push local
 progress up, and my_list() pulls your CURRENT/REPEATING list back down,
