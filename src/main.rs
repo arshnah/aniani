@@ -107,6 +107,8 @@ struct App {
     discover_genre: Option<String>,
     discover_sort: String,
     filtered_results: Arc<Mutex<Vec<sources::Anime>>>,
+    episode_sort_desc: bool,
+    episode_filter: String,
 }
 
 impl App {
@@ -158,6 +160,8 @@ impl App {
             discover_genre: None,
             discover_sort: "TRENDING_DESC".to_string(),
             filtered_results: Arc::new(Mutex::new(vec![])),
+            episode_sort_desc: false,
+            episode_filter: String::new(),
         };
         app.refresh_discover();
         app.refresh_anilist_username();
@@ -900,7 +904,12 @@ impl eframe::App for App {
                 if custom_browse {
                     let filtered = self.filtered_results.lock().unwrap().clone();
                     ui.heading("browse results");
-                    if let Some(a) = self.anime_grid(ui, "filtered", &filtered) {
+                    if filtered.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            ui.label(egui::RichText::new("loading discover results…").color(theme::MUTED));
+                        });
+                    } else if let Some(a) = self.anime_grid(ui, "filtered", &filtered) {
                         self.anime_detail = Some(a);
                     }
                     ui.add_space(20.0);
@@ -980,6 +989,10 @@ impl eframe::App for App {
                     if resp.changed() {
                         self.search_dirty_at = Some(std::time::Instant::now());
                     }
+                    if !self.search_query.is_empty() && ui.button("✖").clicked() {
+                        self.search_query.clear();
+                        self.auto_select = None;
+                    }
                     let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if enter_pressed || ui.button("search").clicked() {
                         self.run_search();
@@ -989,7 +1002,10 @@ impl eframe::App for App {
                 ui.separator();
 
                 if *self.searching.lock().unwrap() {
-                    ui.label(egui::RichText::new("searching…").color(theme::MUTED));
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(egui::RichText::new("searching…").color(theme::MUTED));
+                    });
                 }
 
                 match self.search_source {
@@ -1027,9 +1043,38 @@ impl eframe::App for App {
 
                 if let Some(sel) = &self.selected {
                     let sel_title = sel.title.clone();
-                    let episodes = sel.episodes.lock().unwrap().clone();
+                    let raw_episodes = sel.episodes.lock().unwrap().clone();
                     ui.separator();
                     ui.heading(&sel_title);
+
+                    // Episode filter & sort controls
+                    ui.horizontal(|ui| {
+                        ui.label("filter:");
+                        ui.add(egui::TextEdit::singleline(&mut self.episode_filter).hint_text("ep # or keyword..."));
+                        if !self.episode_filter.is_empty() && ui.button("✖").clicked() {
+                            self.episode_filter.clear();
+                        }
+                        let sort_label = if self.episode_sort_desc { "sort: N..1 ▼" } else { "sort: 1..N ▲" };
+                        if ui.button(sort_label).clicked() {
+                            self.episode_sort_desc = !self.episode_sort_desc;
+                        }
+                    });
+
+                    let mut episodes: Vec<_> = raw_episodes
+                        .into_iter()
+                        .filter(|ep| {
+                            if self.episode_filter.trim().is_empty() {
+                                true
+                            } else {
+                                ep.ep_no.to_lowercase().contains(&self.episode_filter.to_lowercase())
+                            }
+                        })
+                        .collect();
+
+                    if self.episode_sort_desc {
+                        episodes.reverse();
+                    }
+
                     let mut to_play: Option<(String, String)> = None;
                     let mut to_download: Option<(String, String)> = None;
                     let selected_count = self.selected_episodes.len();
@@ -1274,6 +1319,31 @@ impl eframe::App for App {
                 }
 
                 ui.separator();
+                ui.heading("system dependencies");
+                ui.vertical(|ui| {
+                    let deps = [
+                        ("mpv (media player)", platform::find_mpv().is_some()),
+                        ("VLC (media player)", platform::find_vlc().is_some()),
+                        ("curl_chrome136 (anidb scraper)", platform::find_curl_impersonate().is_some()),
+                        ("qBittorrent (torrent engine)", platform::find_qbittorrent().is_some()),
+                        ("ffmpeg (downloader / HLS remux)", which::which("ffmpeg").is_ok()),
+                        ("ani-skip (OP/ED auto skip)", platform::find_ani_skip().is_some()),
+                    ];
+                    for (name, available) in deps {
+                        ui.horizontal(|ui| {
+                            if available {
+                                ui.label(egui::RichText::new("✔").color(egui::Color32::GREEN));
+                                ui.label(name);
+                            } else {
+                                ui.label(egui::RichText::new("✖").color(egui::Color32::RED));
+                                ui.label(egui::RichText::new(name).color(theme::MUTED))
+                                    .on_hover_text("Not found on PATH or in application directory");
+                            }
+                        });
+                    }
+                });
+
+                ui.separator();
                 ui.heading("about");
                 ui.label(format!("aniani v{}", env!("CARGO_PKG_VERSION")));
                 if ui.button("check for updates").clicked() {
@@ -1327,10 +1397,11 @@ impl eframe::App for App {
                         }
                     });
                 });
+            let esc_pressed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
             if watch {
                 self.open_in_search(&anime.title);
                 self.anime_detail = None;
-            } else if !open || close_clicked {
+            } else if !open || close_clicked || esc_pressed {
                 self.anime_detail = None;
             }
         }
