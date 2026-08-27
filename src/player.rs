@@ -29,6 +29,7 @@ impl MpvPlayer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_running(&mut self) -> bool {
         match &mut self.proc {
             Some(p) => matches!(p.try_wait(), Ok(None)),
@@ -111,6 +112,7 @@ impl MpvPlayer {
         Some(Status { time, duration, paused })
     }
 
+    #[allow(dead_code)]
     pub fn set_pause(&mut self, paused: bool) {
         self.set("pause", json!(paused));
     }
@@ -253,6 +255,7 @@ impl VlcPlayer {
         format!("http://127.0.0.1:{}/requests/status.json", self.port)
     }
 
+    #[allow(dead_code)]
     pub fn is_running(&mut self) -> bool {
         match &mut self.proc {
             Some(p) => matches!(p.try_wait(), Ok(None)),
@@ -373,6 +376,7 @@ impl VlcPlayer {
         self.status(Some("pl_pause"), &[]);
     }
 
+    #[allow(dead_code)]
     pub fn set_pause(&self, paused: bool) {
         let currently_paused = self.get_status().map(|s| s.paused).unwrap_or(true);
         if paused != currently_paused {
