@@ -11,6 +11,8 @@ pub enum Cmd {
     Stop,
     SetBackend(String),
     Browsing(String),
+    Reading(String, Option<String>),
+    WatchingShow { title: String, detail: String, cover: Option<String>, pos: f64, dur: f64, paused: bool, live: bool },
     Seek(f64),
     SetVolume(i32),
     SetSpeed(f64),
@@ -52,6 +54,7 @@ impl PlayerHandle {
                         backend.play(&url, Some(&title), referer.as_deref(), start);
                         *thread_now_playing.lock().unwrap() = Some((title.clone(), ep_no.clone()));
                         state::update_history(&source, &anime_id, &title, &ep_no);
+                        state::log_watch_activity();
                         skip_op = None;
                         skip_ed = None;
                         skipped.clear();
@@ -72,6 +75,10 @@ impl PlayerHandle {
                         };
                     }
                     Ok(Cmd::Browsing(detail)) => discord.browsing(&detail),
+                    Ok(Cmd::Reading(detail, cover)) => discord.reading(&detail, cover.as_deref()),
+                    Ok(Cmd::WatchingShow { title, detail, cover, pos, dur, paused, live }) => {
+                        discord.watching_show(&title, &detail, cover.as_deref(), pos, dur, paused, live)
+                    }
                     Ok(Cmd::Seek(seconds)) => backend.seek(seconds),
                     Ok(Cmd::SetVolume(percent)) => backend.set_volume(percent),
                     Ok(Cmd::SetSpeed(rate)) => backend.set_speed(rate),
@@ -170,6 +177,14 @@ impl PlayerHandle {
 
     pub fn browsing(&self, detail: &str) {
         let _ = self.tx.send(Cmd::Browsing(detail.to_string()));
+    }
+
+    pub fn reading(&self, detail: &str, cover: Option<String>) {
+        let _ = self.tx.send(Cmd::Reading(detail.to_string(), cover));
+    }
+
+    pub fn watching_show(&self, title: &str, detail: &str, cover: Option<String>, pos: f64, dur: f64, paused: bool, live: bool) {
+        let _ = self.tx.send(Cmd::WatchingShow { title: title.to_string(), detail: detail.to_string(), cover, pos, dur, paused, live });
     }
 
     pub fn seek(&self, seconds: f64) {

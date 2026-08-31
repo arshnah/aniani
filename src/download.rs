@@ -28,6 +28,22 @@ pub fn dest_path(anime_title: &str, ep_no: &str) -> PathBuf {
     show_dir.join(format!("Episode {ep_no}.mp4"))
 }
 
+pub fn guess_episode_label(filename: &str) -> String {
+    let stem = Path::new(filename).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| filename.to_string());
+    if let Ok(re) = regex::Regex::new(r"(?i)s(\d+)e(\d+)") {
+        if let Some(c) = re.captures(&stem) {
+            let ep = c[2].trim_start_matches('0');
+            return if ep.is_empty() { "0".to_string() } else { ep.to_string() };
+        }
+    }
+    if let Ok(re) = regex::Regex::new(r"(?i)\bep(?:isode)?[\s._-]*(\d+)\b") {
+        if let Some(c) = re.captures(&stem) {
+            return c[1].to_string();
+        }
+    }
+    stem
+}
+
 pub fn import_file(anime_title: &str, ep_label: &str, src: &Path) -> std::io::Result<()> {
     let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
     let show_dir = download_root().join(safe(anime_title));
@@ -109,6 +125,21 @@ pub fn delete_episode(anime_title: &str, ep_no: &str) {
     if std::fs::read_dir(&show_dir).map(|mut d| d.next().is_none()).unwrap_or(false) {
         let _ = std::fs::remove_dir(&show_dir);
     }
+}
+
+pub fn rename_episode(anime_title: &str, old_ep: &str, new_ep: &str) -> std::io::Result<()> {
+    let show_dir = download_root().join(safe(anime_title));
+    let path = locate_episode_file(&show_dir, old_ep)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "episode file not found"))?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+    let dest = show_dir.join(format!("{}.{ext}", safe(new_ep)));
+    std::fs::rename(path, dest)
+}
+
+pub fn rename_show(old_title: &str, new_title: &str) -> std::io::Result<()> {
+    let old_dir = download_root().join(safe(old_title));
+    let new_dir = download_root().join(safe(new_title));
+    std::fs::rename(old_dir, new_dir)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -202,8 +233,10 @@ pub fn run_job(job: &Arc<DownloadJob>) {
     if let Some(referer) = &link.referer {
         cmd.args(["-headers", &format!("Referer: {referer}\r\n")]);
     }
+    let tmp_dest = PathBuf::from(format!("{}.part", job.dest.display()));
+
     cmd.args(["-extension_picky", "0", "-allowed_segment_extensions", "ALL"]);
-    cmd.args(["-i", &link.url, "-c", "copy", "-progress", "pipe:1", "-nostats"]).arg(&job.dest);
+    cmd.args(["-i", &link.url, "-c", "copy", "-progress", "pipe:1", "-nostats"]).arg(&tmp_dest);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut proc = match cmd.spawn() {
@@ -246,13 +279,25 @@ pub fn run_job(job: &Arc<DownloadJob>) {
 
     let mut job_status = job.status.lock().unwrap();
     if *job_status == JobStatus::Cancelled {
-        let _ = std::fs::remove_file(&job.dest);
-    } else if status.map(|s| s.success()).unwrap_or(false) && job.dest.exists() {
+        let _ = std::fs::remove_file(&tmp_dest);
+    } else if status.map(|s| s.success()).unwrap_or(false) && tmp_dest.exists() && std::fs::rename(&tmp_dest, &job.dest).is_ok() {
         *job_status = JobStatus::Done;
         *job.indeterminate.lock().unwrap() = false;
         *job.progress.lock().unwrap() = 1.0;
     } else {
         *job_status = JobStatus::Failed;
-        let _ = std::fs::remove_file(&job.dest);
+        let _ = std::fs::remove_file(&tmp_dest);
+    }
+}
+
+pub fn cleanup_orphaned_downloads() {
+    let Ok(shows) = std::fs::read_dir(download_root()) else { return };
+    for show in shows.flatten() {
+        let Ok(files) = std::fs::read_dir(show.path()) else { continue };
+        for file in files.flatten() {
+            if file.path().extension().and_then(|e| e.to_str()) == Some("part") {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
     }
 }

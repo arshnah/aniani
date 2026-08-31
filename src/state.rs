@@ -56,6 +56,33 @@ pub fn remove_history(anime_title: &str) {
     save(&state_dir().join("history.json"), &entries);
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LibraryEntry {
+    pub title: String,
+    pub cover: Option<String>,
+    pub category: String,
+}
+
+pub fn read_library() -> Vec<LibraryEntry> {
+    load(&state_dir().join("library.json")).unwrap_or_default()
+}
+
+pub fn add_to_library(title: &str, cover: Option<String>, category: &str) {
+    let mut entries = read_library();
+    if let Some(e) = entries.iter_mut().find(|e| e.title == title) {
+        e.category = category.to_string();
+    } else {
+        entries.push(LibraryEntry { title: title.to_string(), cover, category: category.to_string() });
+    }
+    save(&state_dir().join("library.json"), &entries);
+}
+
+pub fn remove_from_library(title: &str) {
+    let mut entries = read_library();
+    entries.retain(|e| e.title != title);
+    save(&state_dir().join("library.json"), &entries);
+}
+
 pub fn position_key(source: &str, anime_title: &str, ep_no: &str) -> String {
     format!("{source}::{anime_title}::{ep_no}")
 }
@@ -72,6 +99,45 @@ pub const RESUME_MIN_SECONDS: f64 = 15.0;
 pub const RESUME_END_MARGIN: f64 = 30.0;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct ShowsPrefs {
+    pub title: String,
+    pub season: String,
+    pub episode: String,
+    pub cover: Option<String>,
+    pub matched_name: Option<String>,
+    pub enabled: bool,
+    pub vlc_host: String,
+    pub vlc_port: String,
+    pub vlc_password: String,
+}
+
+impl Default for ShowsPrefs {
+    fn default() -> Self {
+        ShowsPrefs {
+            title: String::new(),
+            season: String::new(),
+            episode: String::new(),
+            cover: None,
+            matched_name: None,
+            enabled: false,
+            vlc_host: "127.0.0.1".to_string(),
+            vlc_port: "9091".to_string(),
+            vlc_password: "68041633b7ab0bbf716011c7c7344889".to_string(),
+        }
+    }
+}
+
+pub fn load_shows_prefs() -> ShowsPrefs {
+    load(&state_dir().join("shows_prefs.json")).unwrap_or_default()
+}
+
+pub fn save_shows_prefs(prefs: &ShowsPrefs) {
+    save(&state_dir().join("shows_prefs.json"), prefs);
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct Prefs {
     pub source: String,
     pub player: String,
@@ -80,6 +146,9 @@ pub struct Prefs {
     pub anilist_client_id: String,
     pub anilist_sync: bool,
     pub compact_mode: bool,
+    pub mal_client_id: String,
+    pub mal_client_secret: String,
+    pub mal_sync: bool,
 }
 
 impl Default for Prefs {
@@ -92,6 +161,9 @@ impl Default for Prefs {
             anilist_client_id: String::new(),
             anilist_sync: false,
             compact_mode: false,
+            mal_client_id: String::new(),
+            mal_client_secret: String::new(),
+            mal_sync: false,
         }
     }
 }
@@ -102,4 +174,57 @@ pub fn load_prefs() -> Prefs {
 
 pub fn save_prefs(prefs: &Prefs) {
     save(&state_dir().join("prefs.json"), prefs);
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct ReaderPrefs {
+    pub library_dir: String,
+    pub right_to_left: bool,
+    pub scroll_mode: bool,
+    pub font_size: f32,
+}
+
+impl Default for ReaderPrefs {
+    fn default() -> Self {
+        ReaderPrefs { library_dir: String::new(), right_to_left: false, scroll_mode: false, font_size: 18.0 }
+    }
+}
+
+pub fn load_reader_prefs() -> ReaderPrefs {
+    load(&state_dir().join("reader_prefs.json")).unwrap_or_default()
+}
+
+pub fn save_reader_prefs(prefs: &ReaderPrefs) {
+    save(&state_dir().join("reader_prefs.json"), prefs);
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct ReaderPosition {
+    pub chapter: usize,
+    pub page: usize,
+}
+
+pub fn load_reader_positions() -> std::collections::HashMap<String, ReaderPosition> {
+    load(&state_dir().join("reader_positions.json")).unwrap_or_default()
+}
+
+pub fn save_reader_position(book_path: &str, pos: ReaderPosition) {
+    let mut positions = load_reader_positions();
+    positions.insert(book_path.to_string(), pos);
+    save(&state_dir().join("reader_positions.json"), &positions);
+}
+
+pub fn today_bucket() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64 / 86400).unwrap_or(0)
+}
+
+pub fn log_watch_activity() {
+    let mut log: std::collections::HashMap<i64, u32> = load(&state_dir().join("watch_log.json")).unwrap_or_default();
+    *log.entry(today_bucket()).or_insert(0) += 1;
+    save(&state_dir().join("watch_log.json"), &log);
+}
+
+pub fn read_watch_activity() -> std::collections::HashMap<i64, u32> {
+    load(&state_dir().join("watch_log.json")).unwrap_or_default()
 }

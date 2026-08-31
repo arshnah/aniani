@@ -7,6 +7,21 @@ being found unless it's on PATH (now also checked next to the exe
 itself). still only tested on a couple of machines, not broad
 hardware/driver coverage.
 
+vlc status polling was silently dead: VlcPlayer::play() spawned vlc with
+`--extraintf http --http-port N` but no `--http-host`, and on this VLC
+version (3.0.23) that meant the HTTP interface never actually bound to
+anything -- get_status() polled a port nothing was listening on, always
+got a connection-refused, and used `.ok()?` to swallow it with zero
+logging. Effect: no progress bar, no Discord "watching" presence, no
+position-save, for every VLC-backed playback -- silently, since nothing
+ever logged the failure. Confirmed live: `ss -tlnp` showed nothing
+listening on the port vlc was told to use, `curl` got connection
+refused, and adding `--http-host 127.0.0.1` to the spawn args fixed it
+end-to-end (verified with a real status.json response back). Root cause
+was found by checking the actual running vlc process and its debug.log
+output rather than guessing from the Rust side -- the Rust code itself
+had no bug, it was just polling a genuinely-dead endpoint.
+
 yuma (aniwatchtv.to) stream resolution: search() and episodes() work,
 watch() is not implemented and there are no plans to add it. Looked into
 wiring it up properly (aniwatchtv is a HiAnime/megacloud-family site,
@@ -17,6 +32,111 @@ following a Crunchyroll takedown -- that's specifically about extracting
 playable stream URLs from a site serving unlicensed Crunchyroll content.
 Decided not to reimplement it here given that precedent. Search and
 episode listing (metadata only, no stream extraction) stay as they are.
+
+feature roadmap, surveyed from a handful of other open-source anime
+apps (mangayomi, unyo-app, Zenshin, Kitsune, Awery, Moopa) for ideas
+worth bringing over -- most of what those apps do beyond streaming,
+aniani already had (AniList sync, continue watching, recent activity).
+what's actually new and worth doing, roughly in build order:
+- library categories: done. a new Library tab plus "add to library" /
+  "update" / "remove from library" in the anime detail popup, backed by
+  library.json (state::LibraryEntry { title, cover, category }). Free-
+  text category per entry, grouped and sorted alphabetically on the
+  Library tab (empty category sorts first as "uncategorized"). aniani
+  had no "add to library" concept at all before this.
+- watch-activity heatmap: done. Turned out not to need chrono after
+  all -- a GitHub-style grid on the History tab (18 weeks x 7 days),
+  backed by a new watch_log.json (day-bucket -> episode count, day
+  bucket computed as unix-seconds/86400, no calendar library needed).
+  Logged from the same spot worker.rs already calls
+  state::update_history() on every real Play command, so it counts
+  actual playback starts, not just search views.
+- multi-tracker support: MyAnimeList done (src/mal.rs), SIMKL/Trakt not
+  attempted. MAL's API mirrors AniList's shape closely enough to reuse
+  the same UX (paste client id [+ secret, MAL also needs that], open
+  authorize page, paste the code back) -- OAuth2 with PKCE (`plain`
+  method only, no S256), authorization-code grant, access tokens expire
+  in 1 hour so mal.rs refreshes-and-retries once on any 401. Progress
+  sync is a simple "set num_watched_episodes" PATCH, same as AniList's
+  "set progress" mutation. Verified the exact endpoints/flow live
+  before writing code (myanimelist.net/apiconfig/references/authorization,
+  api.myanimelist.net/v2). SIMKL and Trakt are architecturally
+  different and deliberately not attempted: both use an episode-ID
+  "add to history" sync model (search show -> resolve show id -> match
+  season/episode -> add that episode), not a simple "set progress to N"
+  call like AniList/MAL. Anime episode numbering (absolute vs.
+  season-based, dub/sub splits, OVA/movie entries as separate items) is
+  a well-known mismatch source against exactly that kind of season-and-
+  episode-number matching, and getting it subtly wrong means silently
+  reporting the wrong episode as watched -- worse than not syncing at
+  all. Decided not to guess at that blind; would need real live testing
+  against both APIs to trust it, which is its own dedicated pass.
+- manga/novels/comics reader: merged into aniani after all (src/reader.rs,
+  Tab::Reader), overriding the "separate app" call above. Local-files-only
+  (Phase 0 from the standalone research doc, ~/Projects/manga-reader-
+  roadmap.md) -- no scraping, no source integrations. CBZ and EPUB read
+  natively: paginated (with left-to-right/right-to-left toggle) and
+  continuous-scroll modes for image books, plus for EPUB a real chapter
+  list with jump-to-chapter, a synthetic paginated-text mode (character-
+  budgeted, not true text reflow), inline images in reading order, and
+  a saved per-book reading position (reader_positions.json). CBZ image
+  formats: png/jpeg/gif/webp/bmp/tiff/ico/tga/qoi/pnm/dds all decode
+  (all pure-Rust image crate codecs). AVIF does not: the image crate's
+  only AVIF decoder needs the `dav1d` C library via a hard system
+  dependency (system-deps/pkg-config, or a git-clone-and-meson-build
+  fallback if not found) -- confirmed by trying it, it built here only
+  because libdav1d happens to already be installed on this machine.
+  That's a real risk to the "windows support" line above and to any
+  fresh dev machine, so it was deliberately left out rather than shipped
+  fragile; would need vendoring or a pure-Rust AV1 decoder to reconsider.
+  CBR and PDF now read too. CBR via the `unrar` crate (MIT-licensed
+  wrapper around rarlab's official unrar C library, vendored/compiled
+  from source at build time, no system libunrar needed unlike the AVIF
+  situation -- extract-only usage, which is exactly what rarlab's
+  unrarsrc license permits for free redistribution). PDF via `lopdf`
+  (pure Rust, no native deps) -- only extracts embedded DCTDecode
+  (JPEG) page images, which covers the overwhelming case for scanned
+  manga/comic PDFs; PDFs with vector/text content or non-JPEG image
+  filters (FlateDecode raw samples, JPXDecode/JPEG2000, CCITTFax) aren't
+  supported, deliberately -- full rendering would need pdfium/mupdf,
+  both native-dependency-heavy like the AVIF situation. Both verified
+  against real fixtures before considering them done: CBR against the
+  unrar crate's own bundled test archive (exercises open/read-header/
+  skip/extract correctly, though that fixture has no images so only the
+  skip path was exercised end-to-end, not read()), PDF against a
+  locally-built 2-page JPEG PDF (confirmed both pages extract as valid
+  JPEGs in correct order).
+  Cover art: EPUB books with real title+author metadata get a cover
+  fetched from the user's own bookcovers.arshnah.in (bookcover-api fork)
+  and shown in the library grid; CBZ/manga entries don't get this since
+  there's no reliable author metadata to search on and it's a novel-
+  cover service (Goodreads-backed), not a manga source. Discord presence
+  now also reports "Reading {title}" / "Reading {title} · {chapter}"
+  while a book is open, reusing the existing browsing() Cmd.
+  Phase 1 (official APIs) checked live 2026-08-26: none of MangaPlus
+  (Shueisha), WEBTOON (Naver), or webnovel.com have an open public
+  developer API. MangaPlus and WEBTOON only have reverse-engineered/
+  unofficial clients and scrapers -- same risk class as yuma. webnovel.com
+  has a gated "developer certification" process (id/business license),
+  enterprise-partner-only, not an individual-signup API. So Phase 1 is a
+  dead end, same shape as the yuma/aniwatch situation on the anime side.
+  Phase 2 (unofficial aggregator scraping): explicitly greenlit this
+  session (unlike the anime-side yuma call, which stays skipped).
+  Implemented against MangaDex's own public, documented, actively-
+  maintained REST API (api.mangadex.org) rather than scraping their
+  website -- search, per-manga chapter feed (with scanlation-group
+  credit shown per chapter, per their API usage policy), and reading
+  via their official at-home image-server handoff. New "mangadex" tab
+  inside the reader alongside "local files". Page images are loaded
+  straight from MangaDex's CDN via egui's uri image loader (no bytes
+  buffered through us) so they reuse the same paginated/scroll reader
+  UI as local CBZ. Verified live against the real API before writing
+  the parser (searched, pulled a real manga/chapter, hit at-home/server
+  for actual page URLs) -- one gotcha found and handled: officially-
+  licensed/simulpub chapters (e.g. early One Piece via a MangaPlus
+  partnership) show up in the feed with pages:0 and an externalUrl
+  instead of being hosted by MangaDex at all; those get an "open
+  official site" button instead of a broken read attempt.
 
 anilist tracker: two-way now. whoami/connect/sync-toggle push local
 progress up, and my_list() pulls your CURRENT/REPEATING list back down,

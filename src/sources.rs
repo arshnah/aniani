@@ -205,6 +205,10 @@ pub async fn jikan_cover_for_title(client: &reqwest::Client, title: &str) -> Opt
             return None;
         }
     };
+    if !resp.status().is_success() {
+        crate::platform::debug_log(&format!("jikan_cover_for_title({title}): jikan returned {} (likely rate-limited or MAL is unreachable)", resp.status()));
+        return None;
+    }
     let body: SearchResp = match resp.json().await {
         Ok(b) => b,
         Err(e) => {
@@ -231,6 +235,10 @@ async fn cover_for_title_uncached(client: &reqwest::Client, title: &str) -> Opti
             return None;
         }
     };
+    if !resp.status().is_success() {
+        crate::platform::debug_log(&format!("cover_for_title({title}): anilist returned {}", resp.status()));
+        return None;
+    }
     let body: serde_json::Value = match resp.json().await {
         Ok(b) => b,
         Err(e) => {
@@ -290,16 +298,33 @@ query ($search: String) {
 
 pub async fn discord_media_for(client: &reqwest::Client, title: &str) -> crate::discord::MediaInfo {
     let empty = crate::discord::MediaInfo { image: None, url: None };
-    let Ok(resp) = client
+    let resp = match client
         .post(ANILIST_URL)
         .json(&json!({"query": DISCORD_MEDIA_QUERY, "variables": {"search": title}}))
         .send()
         .await
-    else {
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::platform::debug_log(&format!("discord_media_for({title}): request failed: {e}"));
+            return empty;
+        }
+    };
+    if !resp.status().is_success() {
+        crate::platform::debug_log(&format!("discord_media_for({title}): anilist returned {}", resp.status()));
+        return empty;
+    }
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            crate::platform::debug_log(&format!("discord_media_for({title}): body parse failed: {e}"));
+            return empty;
+        }
+    };
+    let Some(media) = body.get("data").and_then(|d| d.get("Media")) else {
+        crate::platform::debug_log(&format!("discord_media_for({title}): no match on anilist"));
         return empty;
     };
-    let Ok(body) = resp.json::<serde_json::Value>().await else { return empty };
-    let Some(media) = body.get("data").and_then(|d| d.get("Media")) else { return empty };
     let image = media
         .get("coverImage")
         .and_then(|c| c.get("extraLarge").or_else(|| c.get("large")))

@@ -179,6 +179,26 @@ pub fn pid_cmdline_contains(pid: u32, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Discord only shows one local Rich Presence activity at a time. mpd-discord-rpc
+/// (a systemd user service some setups run) holds a competing connection that would
+/// otherwise silently stomp aniani's presence. Best-effort, silent no-op if the
+/// service isn't installed/running -- this must never block startup or shutdown.
+#[cfg(target_os = "linux")]
+pub fn pause_mpd_discord_rpc() {
+    let _ = std::process::Command::new("systemctl").args(["--user", "stop", "mpd-discord-rpc"]).output();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pause_mpd_discord_rpc() {}
+
+#[cfg(target_os = "linux")]
+pub fn resume_mpd_discord_rpc() {
+    let _ = std::process::Command::new("systemctl").args(["--user", "start", "mpd-discord-rpc"]).output();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn resume_mpd_discord_rpc() {}
+
 pub fn find_curl_impersonate() -> Option<String> {
     let names = ["curl_chrome136", "curl_chrome136.exe", "curl-impersonate-chrome.exe"];
     if let Some(found) = find_binary(&names) {

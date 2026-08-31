@@ -3,8 +3,12 @@
 mod discord;
 mod download;
 mod ipc;
+mod mal;
+mod mangadex;
 mod platform;
 mod player;
+mod reader;
+mod shows;
 mod sources;
 mod state;
 mod torrent;
@@ -23,6 +27,9 @@ enum Tab {
     Search,
     Downloads,
     History,
+    Library,
+    Reader,
+    Shows,
     Settings,
 }
 
@@ -91,15 +98,25 @@ struct App {
     anilist_pin_input: String,
     anilist_list: Arc<Mutex<Vec<tracker::ListEntry>>>,
 
+    mal_username: Arc<Mutex<Option<String>>>,
+    mal_code_input: String,
+    mal_code_verifier: String,
+
     media_cache: Arc<Mutex<HashMap<String, discord::MediaInfo>>>,
     pending_torrent_playback: Arc<Mutex<Option<(std::path::PathBuf, String)>>>,
     pending_play: Arc<Mutex<Option<PendingPlay>>>,
 
     downloads: Vec<Arc<download::DownloadJob>>,
     downloaded_library: Arc<Mutex<Vec<download::DownloadedShow>>>,
-    pending_import: Arc<Mutex<Option<std::path::PathBuf>>>,
+    pending_import: Arc<Mutex<Vec<std::path::PathBuf>>>,
     import_title: String,
-    import_ep_label: String,
+    import_labels: Vec<String>,
+    editing_episode: Option<(String, String)>,
+    edit_label_input: String,
+    editing_show: Option<String>,
+    edit_show_input: String,
+    library: Arc<Mutex<Vec<state::LibraryEntry>>>,
+    library_category_input: String,
     seek_drag: Option<f64>,
     update_available: Arc<Mutex<Option<String>>>,
     anime_detail: Option<sources::Anime>,
@@ -107,6 +124,8 @@ struct App {
     discover_genre: Option<String>,
     discover_sort: String,
     filtered_results: Arc<Mutex<Vec<sources::Anime>>>,
+    reader: reader::ReaderState,
+    shows: shows::ShowsState,
 }
 
 impl App {
@@ -115,14 +134,17 @@ impl App {
         let prefs = state::load_prefs();
         let media_cache = Arc::new(Mutex::new(HashMap::new()));
         let player = worker::PlayerHandle::spawn(prefs.player.clone(), media_cache.clone());
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let reader = reader::ReaderState::new(http.clone(), rt.handle().clone(), player.clone());
+        let shows = shows::ShowsState::new(http.clone(), rt.handle().clone(), player.clone());
 
         let app = App {
             rt,
-            http: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+            http,
             tab: Tab::Discover,
             trending: Arc::new(Mutex::new(vec![])),
             popular: Arc::new(Mutex::new(vec![])),
@@ -143,14 +165,23 @@ impl App {
             anilist_client_id_input: String::new(),
             anilist_pin_input: String::new(),
             anilist_list: Arc::new(Mutex::new(vec![])),
+            mal_username: Arc::new(Mutex::new(None)),
+            mal_code_input: String::new(),
+            mal_code_verifier: String::new(),
             media_cache,
             pending_torrent_playback: Arc::new(Mutex::new(None)),
             pending_play: Arc::new(Mutex::new(None)),
             downloads: vec![],
             downloaded_library: Arc::new(Mutex::new(vec![])),
-            pending_import: Arc::new(Mutex::new(None)),
+            pending_import: Arc::new(Mutex::new(vec![])),
             import_title: String::new(),
-            import_ep_label: String::new(),
+            import_labels: vec![],
+            editing_episode: None,
+            edit_label_input: String::new(),
+            editing_show: None,
+            edit_show_input: String::new(),
+            library: Arc::new(Mutex::new(state::read_library())),
+            library_category_input: String::new(),
             seek_drag: None,
             update_available: Arc::new(Mutex::new(None)),
             anime_detail: None,
@@ -158,10 +189,14 @@ impl App {
             discover_genre: None,
             discover_sort: "TRENDING_DESC".to_string(),
             filtered_results: Arc::new(Mutex::new(vec![])),
+            reader,
+            shows,
         };
         app.refresh_discover();
         app.refresh_anilist_username();
         app.refresh_anilist_list();
+        app.refresh_mal_username();
+        download::cleanup_orphaned_downloads();
         app.refresh_downloaded_library();
         app.refresh_continue_watching();
         app.check_for_update();
@@ -194,10 +229,7 @@ impl App {
     }
 
     fn refresh_downloaded_library(&self) {
-        let out = self.downloaded_library.clone();
-        std::thread::spawn(move || {
-            *out.lock().unwrap() = download::list_downloaded();
-        });
+        *self.downloaded_library.lock().unwrap() = download::list_downloaded();
     }
 
     fn refresh_discover(&self) {
@@ -222,6 +254,21 @@ impl App {
         let out = self.anilist_username.clone();
         self.rt.spawn(async move {
             let name = tracker::whoami(&client).await;
+            *out.lock().unwrap() = name;
+        });
+    }
+
+    fn refresh_mal_username(&self) {
+        if !mal::has_token() {
+            *self.mal_username.lock().unwrap() = None;
+            return;
+        }
+        let client = self.http.clone();
+        let client_id = self.prefs.mal_client_id.clone();
+        let client_secret = self.prefs.mal_client_secret.clone();
+        let out = self.mal_username.clone();
+        self.rt.spawn(async move {
+            let name = mal::whoami(&client, &client_id, &client_secret).await;
             *out.lock().unwrap() = name;
         });
     }
@@ -329,10 +376,13 @@ impl App {
     fn resolve_link(sel: &SelectedAnime, ep_ref: &str) -> Option<sources::WatchLink> {
         match sel.source {
             StreamSource::AniDb => sources::anidb_watch(ep_ref, false).ok().flatten(),
-            StreamSource::Yuma => {
-                eprintln!("[yuma] stream resolution not implemented yet, see TODO.txt");
-                None
-            }
+            StreamSource::Yuma => match yuma::watch(ep_ref, false) {
+                Ok(link) => link,
+                Err(e) => {
+                    eprintln!("[yuma] {e}");
+                    None
+                }
+            },
         }
     }
 
@@ -383,6 +433,17 @@ impl App {
             let e = p.ep_no.clone();
             self.rt.spawn(async move {
                 tracker::update_progress(&client, &t, &e).await;
+            });
+        }
+
+        if self.prefs.mal_sync {
+            let client = self.http.clone();
+            let client_id = self.prefs.mal_client_id.clone();
+            let client_secret = self.prefs.mal_client_secret.clone();
+            let t = p.sel.title.clone();
+            let e = p.ep_no.clone();
+            self.rt.spawn(async move {
+                mal::update_progress(&client, &client_id, &client_secret, &t, &e).await;
             });
         }
     }
@@ -460,63 +521,99 @@ impl App {
         self.anime_grid_with_actions(ui, id_salt, list, false).clicked
     }
 
+    fn watch_activity_heatmap(&self, ui: &mut egui::Ui) {
+        ui.heading("activity");
+        let log = state::read_watch_activity();
+        let today = state::today_bucket();
+        const WEEKS: i64 = 18;
+        const CELL: f32 = 12.0;
+        const GAP: f32 = 3.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2((CELL + GAP) * WEEKS as f32, (CELL + GAP) * 7.0), egui::Sense::hover());
+        let painter = ui.painter();
+        for week in 0..WEEKS {
+            for weekday in 0..7 {
+                let days_ago = (WEEKS - 1 - week) * 7 + (6 - weekday);
+                let day = today - days_ago;
+                let count = log.get(&day).copied().unwrap_or(0);
+                let color = match count {
+                    0 => theme::SURFACE_HOVER,
+                    1 => theme::ACCENT_DIM,
+                    2..=3 => egui::Color32::from_rgb(180, 122, 66),
+                    _ => theme::ACCENT,
+                };
+                let x = rect.left() + week as f32 * (CELL + GAP);
+                let y = rect.top() + weekday as f32 * (CELL + GAP);
+                let cell_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(CELL, CELL));
+                painter.rect_filled(cell_rect, 2.0, color);
+                if days_ago >= 0 {
+                    let resp = ui.interact(cell_rect, ui.id().with(("activity_cell", day)), egui::Sense::hover());
+                    let label = if days_ago == 0 { "today".to_string() } else { format!("{days_ago} days ago") };
+                    resp.on_hover_text(format!("{label}: {count} episode{}", if count == 1 { "" } else { "s" }));
+                }
+            }
+        }
+    }
+
     fn anime_grid_with_actions(&self, ui: &mut egui::Ui, id_salt: &str, list: &[sources::Anime], show_actions: bool) -> GridActions {
         let mut actions = GridActions::default();
         egui::ScrollArea::horizontal().id_salt(id_salt).show(ui, |ui| {
             ui.horizontal(|ui| {
                 for anime in list {
-                    let mut action_taken = false;
-                    let frame = egui::Frame::none()
-                        .fill(theme::SURFACE)
-                        .rounding(10.0)
-                        .inner_margin(10.0)
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                ui.set_width(150.0);
-                                let (rect, _) = ui.allocate_exact_size(egui::vec2(150.0, 210.0), egui::Sense::hover());
-                                if ui.is_rect_visible(rect) {
-                                    if let Some(cover) = &anime.cover {
-                                        egui::Image::new(cover).rounding(6.0).paint_at(ui, rect);
-                                    } else {
-                                        ui.painter().rect_filled(rect, 6.0, theme::SURFACE_HOVER);
-                                    }
+                    let mut card_resp = None;
+                    egui::Frame::none().fill(theme::SURFACE).rounding(10.0).inner_margin(10.0).show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(150.0);
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(150.0, 210.0), egui::Sense::click());
+                            if ui.is_rect_visible(rect) {
+                                if let Some(cover) = &anime.cover {
+                                    egui::Image::new(cover).rounding(6.0).paint_at(ui, rect);
                                 } else {
                                     ui.painter().rect_filled(rect, 6.0, theme::SURFACE_HOVER);
                                 }
-                                ui.add_space(4.0);
-                                ui.label(egui::RichText::new(&anime.title).strong().size(14.0));
-                                if let Some(score) = anime.score {
-                                    ui.label(
-                                        egui::RichText::new(format!("★ {score}% rated")).size(12.0).color(theme::MUTED),
-                                    );
-                                }
-                                if show_actions {
-                                    ui.horizontal(|ui| {
-                                        if ui.small_button("episodes").clicked() {
-                                            actions.browse = Some(anime.clone());
-                                            action_taken = true;
-                                        }
-                                        if ui.small_button("remove").clicked() {
-                                            actions.remove = Some(anime.clone());
-                                            action_taken = true;
-                                        }
-                                    });
-                                }
-                            });
+                            } else {
+                                ui.painter().rect_filled(rect, 6.0, theme::SURFACE_HOVER);
+                            }
+                            card_resp = Some(resp);
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&anime.title).strong().size(14.0));
+                            if let Some(score) = anime.score {
+                                ui.label(egui::RichText::new(format!("★ {score}% rated")).size(12.0).color(theme::MUTED));
+                            }
+                            if show_actions {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("episodes").clicked() {
+                                        actions.browse = Some(anime.clone());
+                                    }
+                                    if ui.small_button("remove").clicked() {
+                                        actions.remove = Some(anime.clone());
+                                    }
+                                });
+                            }
                         });
-                    let resp = frame.response.interact(egui::Sense::click());
+                    });
+                    let Some(resp) = card_resp else { continue };
                     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if anime.description.is_empty() {
                         anime.title.clone()
                     } else {
                         anime.description.clone()
                     });
-                    if resp.clicked() && !action_taken {
+                    if resp.clicked() {
                         actions.clicked = Some(anime.clone());
                     }
                 }
             });
         });
         actions
+    }
+
+    fn open_anime_detail(&mut self, anime: sources::Anime) {
+        self.library_category_input =
+            self.library.lock().unwrap().iter().find(|e| e.title == anime.title).map(|e| e.category.clone()).unwrap_or_default();
+        self.anime_detail = Some(anime);
+    }
+
+    fn refresh_library(&self) {
+        *self.library.lock().unwrap() = state::read_library();
     }
 
     fn open_in_search(&mut self, title: &str) {
@@ -680,6 +777,7 @@ mod theme {
     pub const MUTED: Color32 = Color32::from_rgb(158, 156, 150);
     pub const ACCENT: Color32 = Color32::from_rgb(232, 158, 90);
     pub const ACCENT_DIM: Color32 = Color32::from_rgb(107, 74, 43);
+    pub const ERROR: Color32 = Color32::from_rgb(214, 112, 100);
 }
 
 fn fmt_eta(d: std::time::Duration) -> String {
@@ -707,9 +805,9 @@ fn apply_theme(ctx: &egui::Context) {
     style.visuals.selection.bg_fill = theme::ACCENT.gamma_multiply(0.4);
     style.visuals.hyperlink_color = theme::ACCENT;
 
-    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, theme::ACCENT);
-    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, theme::TEXT);
-    style.visuals.selection.stroke = egui::Stroke::new(2.0, theme::ACCENT);
+    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5_f32, theme::ACCENT);
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, theme::TEXT);
+    style.visuals.selection.stroke = egui::Stroke::new(2.0_f32, theme::ACCENT);
 
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
@@ -749,6 +847,7 @@ impl eframe::App for App {
             self.player.stop();
             self.player.browsing("idle");
             state::save_prefs(&self.prefs);
+            platform::resume_mpd_discord_rpc();
             std::process::exit(0);
         }
         if platform::consume_show_request() {
@@ -785,6 +884,9 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.tab, Tab::Search, "search");
                     ui.selectable_value(&mut self.tab, Tab::Downloads, "downloads");
                     ui.selectable_value(&mut self.tab, Tab::History, "history");
+                    ui.selectable_value(&mut self.tab, Tab::Library, "library");
+                    ui.selectable_value(&mut self.tab, Tab::Reader, "books");
+                    ui.selectable_value(&mut self.tab, Tab::Shows, "shows");
                     ui.selectable_value(&mut self.tab, Tab::Settings, "settings");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -901,7 +1003,7 @@ impl eframe::App for App {
                     let filtered = self.filtered_results.lock().unwrap().clone();
                     ui.heading("browse results");
                     if let Some(a) = self.anime_grid(ui, "filtered", &filtered) {
-                        self.anime_detail = Some(a);
+                        self.open_anime_detail(a);
                     }
                     ui.add_space(20.0);
                     return;
@@ -935,10 +1037,11 @@ impl eframe::App for App {
                 }
                 if let Some(anime) = continue_watching_actions.remove {
                     state::remove_history(&anime.title);
+                    self.continue_watching.lock().unwrap().retain(|a| a.title != anime.title);
                     self.refresh_continue_watching();
                 }
                 if let Some(anime) = clicked {
-                    self.anime_detail = Some(anime);
+                    self.open_anime_detail(anime);
                 }
 
                 let anilist_list = self.anilist_list.lock().unwrap().clone();
@@ -961,7 +1064,7 @@ impl eframe::App for App {
                         })
                         .collect();
                     if let Some(anime) = self.anime_grid(ui, "anilist_list", &as_anime) {
-                        self.anime_detail = Some(anime);
+                        self.open_anime_detail(anime);
                     }
                 }
             }
@@ -1066,7 +1169,7 @@ impl eframe::App for App {
                                 to_play = Some((ep.ep_ref.clone(), ep.ep_no.clone()));
                             }
                             if download::is_downloaded(&sel_title, &ep.ep_no) {
-                                ui.label(egui::RichText::new("downloaded").color(theme::MUTED));
+                                ui.add(egui::ProgressBar::new(1.0).desired_width(160.0).text("downloaded"));
                             } else if ui.button("download").clicked() {
                                 to_download = Some((ep.ep_ref.clone(), ep.ep_no.clone()));
                             }
@@ -1081,40 +1184,56 @@ impl eframe::App for App {
                 }
             }
             Tab::Downloads => {
-                if ui.button("import existing file…").clicked() {
+                if ui.button("import existing files…").clicked() {
                     let pending = self.pending_import.clone();
                     std::thread::spawn(move || {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("video", &["mp4", "mkv", "avi", "webm", "mov", "m4v", "ts"]).pick_file() {
-                            *pending.lock().unwrap() = Some(path);
+                        let paths = rfd::FileDialog::new().add_filter("video", &["mp4", "mkv", "avi", "webm", "mov", "m4v", "ts"]).pick_files();
+                        if let Some(paths) = paths {
+                            *pending.lock().unwrap() = paths;
                         }
                     });
                 }
                 let picked = self.pending_import.lock().unwrap().clone();
-                if let Some(path) = &picked {
+                if !picked.is_empty() {
+                    if self.import_labels.len() != picked.len() {
+                        self.import_labels = picked
+                            .iter()
+                            .map(|p| download::guess_episode_label(&p.file_name().unwrap_or_default().to_string_lossy()))
+                            .collect();
+                    }
                     ui.group(|ui| {
-                        ui.label(format!("importing: {}", path.display()));
+                        ui.label(format!("importing {} file(s) -- episode numbers guessed from filenames, edit any that are wrong", picked.len()));
                         ui.horizontal(|ui| {
                             ui.label("show title");
                             ui.text_edit_singleline(&mut self.import_title);
                         });
-                        ui.horizontal(|ui| {
-                            ui.label("episode label");
-                            ui.text_edit_singleline(&mut self.import_ep_label);
+                        egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                            for (path, label) in picked.iter().zip(self.import_labels.iter_mut()) {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(path.file_name().unwrap_or_default().to_string_lossy()).weak().size(11.0));
+                                    ui.label("ep");
+                                    ui.add(egui::TextEdit::singleline(label).desired_width(60.0));
+                                });
+                            }
                         });
                         ui.horizontal(|ui| {
-                            let ready = !self.import_title.trim().is_empty() && !self.import_ep_label.trim().is_empty();
-                            if ui.add_enabled(ready, egui::Button::new("add to library")).clicked() {
-                                if download::import_file(self.import_title.trim(), self.import_ep_label.trim(), path).is_ok() {
+                            let ready = !self.import_title.trim().is_empty() && self.import_labels.iter().all(|l| !l.trim().is_empty());
+                            if ui.add_enabled(ready, egui::Button::new(format!("add all {} to library", picked.len()))).clicked() {
+                                let mut ok = true;
+                                for (path, label) in picked.iter().zip(self.import_labels.iter()) {
+                                    ok &= download::import_file(self.import_title.trim(), label.trim(), path).is_ok();
+                                }
+                                if ok {
                                     self.refresh_downloaded_library();
                                 }
-                                *self.pending_import.lock().unwrap() = None;
+                                *self.pending_import.lock().unwrap() = vec![];
                                 self.import_title.clear();
-                                self.import_ep_label.clear();
+                                self.import_labels.clear();
                             }
                             if ui.button("cancel").clicked() {
-                                *self.pending_import.lock().unwrap() = None;
+                                *self.pending_import.lock().unwrap() = vec![];
                                 self.import_title.clear();
-                                self.import_ep_label.clear();
+                                self.import_labels.clear();
                             }
                         });
                     });
@@ -1193,10 +1312,44 @@ impl eframe::App for App {
                 if library.is_empty() {
                     ui.label(egui::RichText::new("nothing downloaded yet").color(theme::MUTED));
                 }
+                let mut rename_committed = false;
                 for show in &library {
                     ui.collapsing(&show.title, |ui| {
+                        let editing_show = self.editing_show.as_deref() == Some(show.title.as_str());
+                        ui.horizontal(|ui| {
+                            if editing_show {
+                                ui.add(egui::TextEdit::singleline(&mut self.edit_show_input).desired_width(200.0));
+                                if ui.button("save").clicked() {
+                                    if download::rename_show(&show.title, self.edit_show_input.trim()).is_ok() {
+                                        rename_committed = true;
+                                    }
+                                    self.editing_show = None;
+                                }
+                                if ui.button("cancel").clicked() {
+                                    self.editing_show = None;
+                                }
+                            } else if ui.small_button("rename show").clicked() {
+                                self.editing_show = Some(show.title.clone());
+                                self.edit_show_input = show.title.clone();
+                            }
+                        });
+                        ui.separator();
                         for ep in &show.episodes {
+                            let editing = self.editing_episode.as_ref() == Some(&(show.title.clone(), ep.clone()));
                             ui.horizontal(|ui| {
+                                if editing {
+                                    ui.add(egui::TextEdit::singleline(&mut self.edit_label_input).desired_width(120.0));
+                                    if ui.button("save").clicked() {
+                                        if download::rename_episode(&show.title, ep, self.edit_label_input.trim()).is_ok() {
+                                            rename_committed = true;
+                                        }
+                                        self.editing_episode = None;
+                                    }
+                                    if ui.button("cancel").clicked() {
+                                        self.editing_episode = None;
+                                    }
+                                    return;
+                                }
                                 let label = if ep.chars().all(|c| c.is_ascii_digit() || c == '.') {
                                     format!("episode {ep}")
                                 } else {
@@ -1206,7 +1359,12 @@ impl eframe::App for App {
                                 if ui.button("play").clicked() {
                                     if let Some(path) = download::find_episode_file(&show.title, ep) {
                                         self.player.play(&format!("file://{}", path.display()), &show.title, ep, None, None, "downloaded", &show.title);
+                                        self.fetch_discord_cover(&show.title);
                                     }
+                                }
+                                if ui.button("edit").clicked() {
+                                    self.editing_episode = Some((show.title.clone(), ep.clone()));
+                                    self.edit_label_input = ep.clone();
                                 }
                                 if ui.button("delete").clicked() {
                                     download::delete_episode(&show.title, ep);
@@ -1216,8 +1374,13 @@ impl eframe::App for App {
                         }
                     });
                 }
+                if rename_committed {
+                    self.refresh_downloaded_library();
+                }
             }
             Tab::History => {
+                self.watch_activity_heatmap(ui);
+                ui.separator();
                 let history = state::read_history();
                 if history.is_empty() {
                     ui.label(egui::RichText::new("nothing watched yet").color(theme::MUTED));
@@ -1230,6 +1393,42 @@ impl eframe::App for App {
                         }
                     });
                 }
+            }
+            Tab::Library => {
+                let library = self.library.lock().unwrap().clone();
+                if library.is_empty() {
+                    ui.label(egui::RichText::new("nothing in your library yet -- add one from its detail popup").color(theme::MUTED));
+                }
+                let mut categories: Vec<String> = library.iter().map(|e| e.category.clone()).collect();
+                categories.sort();
+                categories.dedup();
+                let mut remove_clicked: Option<String> = None;
+                for category in &categories {
+                    let heading = if category.is_empty() { "uncategorized" } else { category.as_str() };
+                    ui.heading(heading);
+                    for entry in library.iter().filter(|e| &e.category == category) {
+                        ui.horizontal(|ui| {
+                            ui.label(&entry.title);
+                            if ui.button("open in search").clicked() {
+                                self.open_in_search(&entry.title);
+                            }
+                            if ui.button("remove").clicked() {
+                                remove_clicked = Some(entry.title.clone());
+                            }
+                        });
+                    }
+                    ui.add_space(8.0);
+                }
+                if let Some(title) = remove_clicked {
+                    state::remove_from_library(&title);
+                    self.refresh_library();
+                }
+            }
+            Tab::Reader => {
+                self.reader.ui(ui);
+            }
+            Tab::Shows => {
+                self.shows.ui(ui);
             }
             Tab::Settings => {
                 ui.heading("player");
@@ -1269,6 +1468,51 @@ impl eframe::App for App {
                             tracker::save_token(&self.anilist_pin_input);
                             self.refresh_anilist_username();
                             self.refresh_anilist_list();
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.heading("myanimelist");
+                let mal_username = self.mal_username.lock().unwrap().clone();
+                if let Some(name) = mal_username {
+                    ui.label(format!("connected as {name}"));
+                    ui.checkbox(&mut self.prefs.mal_sync, "sync watched episodes");
+                    if ui.button("disconnect").clicked() {
+                        mal::clear_token();
+                        *self.mal_username.lock().unwrap() = None;
+                    }
+                } else {
+                    ui.label("paste your MAL API client id and secret (from myanimelist.net/apiconfig), open the authorize link, sign in, then paste the \"code\" value from the resulting URL back:");
+                    ui.horizontal(|ui| {
+                        ui.label("client id");
+                        ui.text_edit_singleline(&mut self.prefs.mal_client_id);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("client secret");
+                        ui.text_edit_singleline(&mut self.prefs.mal_client_secret);
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("open authorize page").clicked() && !self.prefs.mal_client_id.is_empty() {
+                            self.mal_code_verifier = mal::gen_code_verifier();
+                            let _ = open::that(mal::authorize_url(&self.prefs.mal_client_id, &self.mal_code_verifier));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.mal_code_input);
+                        if ui.button("connect").clicked() && !self.mal_code_input.is_empty() && !self.mal_code_verifier.is_empty() {
+                            let client = self.http.clone();
+                            let client_id = self.prefs.mal_client_id.clone();
+                            let client_secret = self.prefs.mal_client_secret.clone();
+                            let code = self.mal_code_input.clone();
+                            let code_verifier = self.mal_code_verifier.clone();
+                            let out = self.mal_username.clone();
+                            self.rt.spawn(async move {
+                                if mal::exchange_code(&client, &client_id, &client_secret, &code, &code_verifier).await.is_some() {
+                                    *out.lock().unwrap() = mal::whoami(&client, &client_id, &client_secret).await;
+                                }
+                            });
+                            self.mal_code_input.clear();
                         }
                     });
                 }
@@ -1317,6 +1561,20 @@ impl eframe::App for App {
                     if !anime.description.is_empty() {
                         ui.label(&anime.description);
                     }
+                    ui.add_space(8.0);
+                    let in_library = self.library.lock().unwrap().iter().any(|e| e.title == anime.title);
+                    ui.horizontal(|ui| {
+                        ui.label("category");
+                        ui.text_edit_singleline(&mut self.library_category_input);
+                        if ui.button(if in_library { "update" } else { "add to library" }).clicked() {
+                            state::add_to_library(&anime.title, anime.cover.clone(), self.library_category_input.trim());
+                            self.refresh_library();
+                        }
+                        if in_library && ui.button("remove from library").clicked() {
+                            state::remove_from_library(&anime.title);
+                            self.refresh_library();
+                        }
+                    });
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui.button("watch").clicked() {
@@ -1355,6 +1613,7 @@ fn main() -> eframe::Result<()> {
         platform::request_show_running_instance();
         return Ok(());
     }
+    platform::pause_mpd_discord_rpc();
 
     eframe::run_native(
         "aniani",

@@ -29,12 +29,6 @@ impl MpvPlayer {
         }
     }
 
-    pub fn is_running(&mut self) -> bool {
-        match &mut self.proc {
-            Some(p) => matches!(p.try_wait(), Ok(None)),
-            None => false,
-        }
-    }
 
     pub fn play(
         &mut self,
@@ -109,10 +103,6 @@ impl MpvPlayer {
         let duration = self.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let paused = self.get("pause").and_then(|v| v.as_bool()).unwrap_or(false);
         Some(Status { time, duration, paused })
-    }
-
-    pub fn set_pause(&mut self, paused: bool) {
-        self.set("pause", json!(paused));
     }
 
     pub fn toggle_pause(&mut self) {
@@ -322,7 +312,7 @@ impl VlcPlayer {
         let mut cmd = Command::new(vlc_bin);
         cmd.args([
             "-I", "dummy", "--no-video-title-show",
-            "--extraintf", "http", "--http-password", &self.password, "--http-port",
+            "--extraintf", "http", "--http-password", &self.password, "--http-host", "127.0.0.1", "--http-port",
         ]);
         cmd.arg(self.port.to_string());
         if let Some(r) = referer {
@@ -371,13 +361,6 @@ impl VlcPlayer {
 
     pub fn toggle_pause(&self) {
         self.status(Some("pl_pause"), &[]);
-    }
-
-    pub fn set_pause(&self, paused: bool) {
-        let currently_paused = self.get_status().map(|s| s.paused).unwrap_or(true);
-        if paused != currently_paused {
-            self.toggle_pause();
-        }
     }
 
     pub fn seek(&self, seconds: f64) {
