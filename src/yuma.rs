@@ -63,6 +63,7 @@ pub fn episodes(anime_id: &str) -> anyhow::Result<Vec<Episode>> {
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub fn watch(_ep_ref: &str, _dub: bool) -> anyhow::Result<Option<crate::sources::WatchLink>> {
     anyhow::bail!("yuma stream resolution not implemented, see TODO.txt")
 }
