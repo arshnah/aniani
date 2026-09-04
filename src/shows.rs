@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,10 +55,42 @@ async fn tvmaze_search(client: &reqwest::Client, query: &str) -> Option<(String,
     Some((name, cover))
 }
 
+async fn wikipedia_search(client: &reqwest::Client, query: &str) -> Option<(String, Option<String>)> {
+    let search_url = "https://en.wikipedia.org/w/api.php";
+    let resp = client
+        .get(search_url)
+        .query(&[
+            ("action", "query"),
+            ("list", "search"),
+            ("srsearch", &format!("{query} film")),
+            ("format", "json"),
+            ("srlimit", "1"),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let title = data.get("query")?.get("search")?.as_array()?.first()?.get("title")?.as_str()?.to_string();
+
+    let summary_url = format!("https://en.wikipedia.org/api/rest_v1/page/summary/{}", urlencoding::encode(&title));
+    let resp = client.get(&summary_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let name = data.get("title")?.as_str()?.to_string();
+    let cover = data.get("thumbnail").and_then(|t| t.get("source")).and_then(|v| v.as_str()).map(|s| s.to_string());
+    Some((name, cover))
+}
+
 pub struct ShowsState {
     prefs: state::ShowsPrefs,
     season: String,
     episode: String,
+    cover_url_input: String,
     http: reqwest::Client,
     rt: tokio::runtime::Handle,
     searching: Arc<Mutex<bool>>,
@@ -65,6 +98,7 @@ pub struct ShowsState {
     matched_name: Arc<Mutex<Option<String>>>,
     live_status: Arc<Mutex<Option<(f64, f64, bool)>>>,
     shared: Arc<Mutex<Shared>>,
+    search_generation: Arc<AtomicU64>,
 }
 
 fn season_episode_label(season: &str, episode: &str) -> String {
@@ -126,6 +160,7 @@ impl ShowsState {
         ShowsState {
             season: prefs.season.clone(),
             episode: prefs.episode.clone(),
+            cover_url_input: String::new(),
             matched_name: Arc::new(Mutex::new(prefs.matched_name.clone())),
             prefs,
             http,
@@ -134,13 +169,19 @@ impl ShowsState {
             search_error: Arc::new(Mutex::new(None)),
             live_status,
             shared,
+            search_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn sync_shared(&self) {
+        let detail = if self.prefs.is_movie {
+            String::new()
+        } else {
+            season_episode_label(&self.season, &self.episode)
+        };
         *self.shared.lock().unwrap() = Shared {
             title: self.prefs.title.clone(),
-            detail: season_episode_label(&self.season, &self.episode),
+            detail,
             cover: self.prefs.cover.clone(),
             enabled: self.prefs.enabled,
             vlc_host: self.prefs.vlc_host.clone(),
@@ -164,17 +205,27 @@ impl ShowsState {
         *self.search_error.lock().unwrap() = None;
         let client = self.http.clone();
         let title = self.prefs.title.clone();
+        let is_movie = self.prefs.is_movie;
         let searching = self.searching.clone();
         let error = self.search_error.clone();
         let matched_name = self.matched_name.clone();
         let shared = self.shared.clone();
+        let generation = self.search_generation.clone();
+        let this_generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.rt.spawn(async move {
-            match tvmaze_search(&client, &title).await {
+            let result = if is_movie { wikipedia_search(&client, &title).await } else { tvmaze_search(&client, &title).await };
+            if generation.load(Ordering::SeqCst) != this_generation {
+                return;
+            }
+            match result {
                 Some((name, cover)) => {
                     *matched_name.lock().unwrap() = Some(name);
                     shared.lock().unwrap().cover = cover;
                 }
-                None => *error.lock().unwrap() = Some("no match found on tvmaze".to_string()),
+                None => {
+                    let source = if is_movie { "wikipedia" } else { "tvmaze" };
+                    *error.lock().unwrap() = Some(format!("no match found on {source}"))
+                }
             }
             *searching.lock().unwrap() = false;
         });
@@ -182,12 +233,24 @@ impl ShowsState {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            egui::RichText::new("track a movie/tv show you're watching outside aniani -- manual title/season/episode, cover from tvmaze, discord presence with live position if vlc's http interface is reachable")
+            egui::RichText::new("track a movie/tv show you're watching outside aniani -- manual title/season/episode, cover from tvmaze or wikipedia, discord presence with live position if vlc's http interface is reachable")
                 .weak(),
         );
         ui.separator();
 
         let mut changed = false;
+        ui.horizontal(|ui| {
+            if ui.selectable_label(!self.prefs.is_movie, "show").clicked() && self.prefs.is_movie {
+                self.prefs.is_movie = false;
+                changed = true;
+            }
+            if ui.selectable_label(self.prefs.is_movie, "movie").clicked() && !self.prefs.is_movie {
+                self.prefs.is_movie = true;
+                self.season.clear();
+                self.episode.clear();
+                changed = true;
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("title");
             if ui.text_edit_singleline(&mut self.prefs.title).changed() {
@@ -195,13 +258,15 @@ impl ShowsState {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("season");
-            if ui.add(egui::TextEdit::singleline(&mut self.season).desired_width(50.0)).changed() {
-                changed = true;
-            }
-            ui.label("episode");
-            if ui.add(egui::TextEdit::singleline(&mut self.episode).desired_width(50.0)).changed() {
-                changed = true;
+            if !self.prefs.is_movie {
+                ui.label("season");
+                if ui.add(egui::TextEdit::singleline(&mut self.season).desired_width(50.0)).changed() {
+                    changed = true;
+                }
+                ui.label("episode");
+                if ui.add(egui::TextEdit::singleline(&mut self.episode).desired_width(50.0)).changed() {
+                    changed = true;
+                }
             }
             if ui.button("search cover").clicked() {
                 self.search_cover();
@@ -209,7 +274,8 @@ impl ShowsState {
         });
 
         if *self.searching.lock().unwrap() {
-            ui.label(egui::RichText::new("searching tvmaze...").color(theme::MUTED));
+            let source = if self.prefs.is_movie { "wikipedia" } else { "tvmaze" };
+            ui.label(egui::RichText::new(format!("searching {source}...")).color(theme::MUTED));
         }
         if let Some(err) = self.search_error.lock().unwrap().clone() {
             ui.colored_label(theme::ERROR, err);
@@ -225,6 +291,27 @@ impl ShowsState {
                 changed = true;
             }
         }
+
+        ui.horizontal(|ui| {
+            ui.label("cover url");
+            ui.text_edit_singleline(&mut self.cover_url_input);
+            if ui.button("set cover").clicked() && !self.cover_url_input.trim().is_empty() {
+                self.prefs.cover = Some(self.cover_url_input.trim().to_string());
+                self.shared.lock().unwrap().cover = self.prefs.cover.clone();
+                self.cover_url_input.clear();
+                changed = true;
+            }
+            if ui.button("browse...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("image", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+                    .pick_file()
+                {
+                    self.prefs.cover = Some(format!("file://{}", path.display()));
+                    self.shared.lock().unwrap().cover = self.prefs.cover.clone();
+                    changed = true;
+                }
+            }
+        });
 
         ui.separator();
         if ui.checkbox(&mut self.prefs.enabled, "set discord presence").clicked() {

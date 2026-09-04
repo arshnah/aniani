@@ -102,6 +102,7 @@ pub const RESUME_END_MARGIN: f64 = 30.0;
 #[serde(default)]
 pub struct ShowsPrefs {
     pub title: String,
+    pub is_movie: bool,
     pub season: String,
     pub episode: String,
     pub cover: Option<String>,
@@ -116,6 +117,7 @@ impl Default for ShowsPrefs {
     fn default() -> Self {
         ShowsPrefs {
             title: String::new(),
+            is_movie: false,
             season: String::new(),
             episode: String::new(),
             cover: None,
