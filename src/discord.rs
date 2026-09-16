@@ -1,15 +1,17 @@
-use discord_rich_presence::activity::{Activity, Assets, Button, Timestamps};
+use discord_rich_presence::activity::{Activity, ActivityType, Assets, Button, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CLIENT_ID: &str = "1539979776322965555";
 const BROWSING_ICON: &str = "https://cdn.myanimelist.net/img/sp/icon/apple-touch-icon-256.png";
+const REPO_URL: &str = "https://ani.arshnah.in";
 
 #[derive(Clone)]
 pub struct MediaInfo {
     pub image: Option<String>,
     pub url: Option<String>,
+    pub episode_titles: HashMap<String, String>,
 }
 
 pub struct DiscordPresence {
@@ -103,14 +105,25 @@ impl DiscordPresence {
         let state_key = (show.to_string(), ep_no.to_string(), paused);
         let state_changed = self.last_watching_log.as_ref() != Some(&state_key);
         let info = self.cache.get(show);
-        let state = if paused { format!("Paused · Episode {ep_no}") } else { format!("Watching · Episode {ep_no}") };
+        // AniList exposes per-episode subtitles (e.g. "Emperor Dragon") for shows a
+        // streaming partner has published episode titles for; fall back to the plain
+        // episode number when it doesn't have one.
+        let episode_label = info
+            .and_then(|i| i.episode_titles.get(ep_no))
+            .map(|title| title.to_string())
+            .unwrap_or_else(|| format!("Episode {ep_no}"));
+        let state = if paused { format!("Paused · {episode_label}") } else { episode_label };
 
         let mut assets = Assets::new();
         if let Some(i) = info.and_then(|i| i.image.as_deref()) {
             assets = assets.large_image(i).large_text(show);
         }
 
-        let mut activity = Activity::new().details(&show[..show.len().min(128)]).state(&state).assets(assets);
+        let mut activity = Activity::new()
+            .activity_type(ActivityType::Watching)
+            .details(&show[..show.len().min(128)])
+            .state(&state)
+            .assets(assets);
 
         if !paused {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
@@ -122,11 +135,12 @@ impl DiscordPresence {
             activity = activity.timestamps(ts);
         }
 
-        let buttons_holder;
+        let mut buttons_holder = Vec::new();
         if let Some(url) = info.and_then(|i| i.url.as_deref()) {
-            buttons_holder = vec![Button::new("View on AniList", url)];
-            activity = activity.buttons(buttons_holder);
+            buttons_holder.push(Button::new("Watch on AniList", url));
         }
+        buttons_holder.push(Button::new("aniani", REPO_URL));
+        activity = activity.buttons(buttons_holder);
 
         if let Some(c) = self.client.as_mut() {
             match c.set_activity(activity) {
@@ -144,7 +158,7 @@ impl DiscordPresence {
         }
     }
 
-    pub fn watching_show(&mut self, title: &str, detail: &str, cover: Option<&str>, pos_seconds: f64, duration_seconds: f64, paused: bool, live: bool) {
+    pub fn watching_show(&mut self, title: &str, detail: &str, cover: Option<&str>, url: Option<&str>, pos_seconds: f64, duration_seconds: f64, paused: bool, live: bool) {
         if !self.ensure_connected() {
             crate::platform::debug_log(&format!("discord: watching_show({title}) skipped -- not connected"));
             return;
@@ -162,7 +176,18 @@ impl DiscordPresence {
         } else {
             format!("TV · Watching · {detail}")
         };
-        let mut activity = Activity::new().details(&title[..title.len().min(128)]).state(&state).assets(assets);
+        let mut buttons_holder = Vec::new();
+        if let Some(url) = url {
+            buttons_holder.push(Button::new("Watch", url));
+        }
+        buttons_holder.push(Button::new("aniani", REPO_URL));
+
+        let mut activity = Activity::new()
+            .activity_type(ActivityType::Watching)
+            .details(&title[..title.len().min(128)])
+            .state(&state)
+            .assets(assets)
+            .buttons(buttons_holder);
         if live && !paused {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
             let start = now - pos_seconds as i64;

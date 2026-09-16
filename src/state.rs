@@ -107,6 +107,8 @@ pub struct ShowsPrefs {
     pub episode: String,
     pub cover: Option<String>,
     pub matched_name: Option<String>,
+    pub matched_url: Option<String>,
+    pub tmdb_id: Option<i64>,
     pub enabled: bool,
     pub vlc_host: String,
     pub vlc_port: String,
@@ -122,6 +124,8 @@ impl Default for ShowsPrefs {
             episode: String::new(),
             cover: None,
             matched_name: None,
+            matched_url: None,
+            tmdb_id: None,
             enabled: false,
             vlc_host: "127.0.0.1".to_string(),
             vlc_port: "9091".to_string(),
@@ -151,6 +155,7 @@ pub struct Prefs {
     pub mal_client_id: String,
     pub mal_client_secret: String,
     pub mal_sync: bool,
+    pub tmdb_api_key: String,
 }
 
 impl Default for Prefs {
@@ -166,6 +171,7 @@ impl Default for Prefs {
             mal_client_id: String::new(),
             mal_client_secret: String::new(),
             mal_sync: false,
+            tmdb_api_key: String::new(),
         }
     }
 }

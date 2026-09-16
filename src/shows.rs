@@ -19,6 +19,11 @@ struct Shared {
     title: String,
     detail: String,
     cover: Option<String>,
+    url: Option<String>,
+    is_movie: bool,
+    season: String,
+    episode: String,
+    tmdb_id: Option<i64>,
     enabled: bool,
     vlc_host: String,
     vlc_port: u16,
@@ -39,7 +44,7 @@ fn vlc_status(client: &reqwest::blocking::Client, host: &str, port: u16, passwor
     })
 }
 
-async fn tvmaze_search(client: &reqwest::Client, query: &str) -> Option<(String, Option<String>)> {
+async fn tvmaze_search(client: &reqwest::Client, query: &str) -> Option<(String, Option<String>, Option<String>)> {
     let url = "https://api.tvmaze.com/singlesearch/shows";
     let resp = client.get(url).query(&[("q", query)]).send().await.ok()?;
     if !resp.status().is_success() {
@@ -52,10 +57,11 @@ async fn tvmaze_search(client: &reqwest::Client, query: &str) -> Option<(String,
         .and_then(|i| i.get("original").or_else(|| i.get("medium")))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    Some((name, cover))
+    let page_url = data.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+    Some((name, cover, page_url))
 }
 
-async fn wikipedia_search(client: &reqwest::Client, query: &str) -> Option<(String, Option<String>)> {
+async fn wikipedia_search(client: &reqwest::Client, query: &str) -> Option<(String, Option<String>, Option<String>)> {
     let search_url = "https://en.wikipedia.org/w/api.php";
     let resp = client
         .get(search_url)
@@ -83,7 +89,8 @@ async fn wikipedia_search(client: &reqwest::Client, query: &str) -> Option<(Stri
     let data: serde_json::Value = resp.json().await.ok()?;
     let name = data.get("title")?.as_str()?.to_string();
     let cover = data.get("thumbnail").and_then(|t| t.get("source")).and_then(|v| v.as_str()).map(|s| s.to_string());
-    Some((name, cover))
+    let page_url = data.get("content_urls").and_then(|c| c.get("desktop")).and_then(|d| d.get("page")).and_then(|v| v.as_str()).map(|s| s.to_string());
+    Some((name, cover, page_url))
 }
 
 pub struct ShowsState {
@@ -96,6 +103,9 @@ pub struct ShowsState {
     searching: Arc<Mutex<bool>>,
     search_error: Arc<Mutex<Option<String>>>,
     matched_name: Arc<Mutex<Option<String>>>,
+    matched_url: Arc<Mutex<Option<String>>>,
+    matched_tmdb_id: Arc<Mutex<Option<i64>>>,
+    tmdb_api_key: String,
     live_status: Arc<Mutex<Option<(f64, f64, bool)>>>,
     shared: Arc<Mutex<Shared>>,
     search_generation: Arc<AtomicU64>,
@@ -119,6 +129,11 @@ impl ShowsState {
             title: prefs.title.clone(),
             detail,
             cover: prefs.cover.clone(),
+            url: prefs.matched_url.clone(),
+            is_movie: prefs.is_movie,
+            season: prefs.season.clone(),
+            episode: prefs.episode.clone(),
+            tmdb_id: prefs.tmdb_id,
             enabled: prefs.enabled,
             vlc_host: prefs.vlc_host.clone(),
             vlc_port: prefs.vlc_port.parse().unwrap_or(9091),
@@ -146,7 +161,8 @@ impl ShowsState {
                             Some(st) => (st.time, st.duration, st.paused, true),
                             None => (0.0, 0.0, false, false),
                         };
-                        player.watching_show(&s.title, &s.detail, s.cover.clone(), pos, dur, paused, live);
+                        let watch_url = s.tmdb_id.map(|id| crate::sources::rivestream_embed_url(id, s.is_movie, &s.season, &s.episode)).or_else(|| s.url.clone());
+                        player.watching_show(&s.title, &s.detail, s.cover.clone(), watch_url, pos, dur, paused, live);
                         was_enabled = true;
                     } else if was_enabled {
                         player.browsing("idle");
@@ -162,6 +178,9 @@ impl ShowsState {
             episode: prefs.episode.clone(),
             cover_url_input: String::new(),
             matched_name: Arc::new(Mutex::new(prefs.matched_name.clone())),
+            matched_url: Arc::new(Mutex::new(prefs.matched_url.clone())),
+            matched_tmdb_id: Arc::new(Mutex::new(prefs.tmdb_id)),
+            tmdb_api_key: String::new(),
             prefs,
             http,
             rt,
@@ -183,6 +202,11 @@ impl ShowsState {
             title: self.prefs.title.clone(),
             detail,
             cover: self.prefs.cover.clone(),
+            url: self.prefs.matched_url.clone(),
+            is_movie: self.prefs.is_movie,
+            season: self.season.clone(),
+            episode: self.episode.clone(),
+            tmdb_id: self.matched_tmdb_id.lock().unwrap().clone(),
             enabled: self.prefs.enabled,
             vlc_host: self.prefs.vlc_host.clone(),
             vlc_port: self.prefs.vlc_port.parse().unwrap_or(0),
@@ -194,6 +218,8 @@ impl ShowsState {
         self.prefs.season = self.season.clone();
         self.prefs.episode = self.episode.clone();
         self.prefs.matched_name = self.matched_name.lock().unwrap().clone();
+        self.prefs.matched_url = self.matched_url.lock().unwrap().clone();
+        self.prefs.tmdb_id = *self.matched_tmdb_id.lock().unwrap();
         state::save_shows_prefs(&self.prefs);
     }
 
@@ -209,18 +235,27 @@ impl ShowsState {
         let searching = self.searching.clone();
         let error = self.search_error.clone();
         let matched_name = self.matched_name.clone();
+        let matched_url = self.matched_url.clone();
+        let matched_tmdb_id = self.matched_tmdb_id.clone();
+        let tmdb_api_key = self.tmdb_api_key.clone();
         let shared = self.shared.clone();
         let generation = self.search_generation.clone();
         let this_generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.rt.spawn(async move {
             let result = if is_movie { wikipedia_search(&client, &title).await } else { tvmaze_search(&client, &title).await };
+            let tmdb_id = crate::sources::tmdb_id_for(&client, &tmdb_api_key, &title, is_movie).await;
             if generation.load(Ordering::SeqCst) != this_generation {
                 return;
             }
+            *matched_tmdb_id.lock().unwrap() = tmdb_id;
+            shared.lock().unwrap().tmdb_id = tmdb_id;
             match result {
-                Some((name, cover)) => {
+                Some((name, cover, url)) => {
                     *matched_name.lock().unwrap() = Some(name);
-                    shared.lock().unwrap().cover = cover;
+                    *matched_url.lock().unwrap() = url.clone();
+                    let mut shared = shared.lock().unwrap();
+                    shared.cover = cover;
+                    shared.url = url;
                 }
                 None => {
                     let source = if is_movie { "wikipedia" } else { "tvmaze" };
@@ -231,7 +266,8 @@ impl ShowsState {
         });
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, tmdb_api_key: &str) {
+        self.tmdb_api_key = tmdb_api_key.to_string();
         ui.label(
             egui::RichText::new("track a movie/tv show you're watching outside aniani -- manual title/season/episode, cover from tvmaze or wikipedia, discord presence with live position if vlc's http interface is reachable")
                 .weak(),
@@ -283,11 +319,24 @@ impl ShowsState {
         if let Some(name) = self.matched_name.lock().unwrap().clone() {
             ui.label(egui::RichText::new(format!("matched: {name}")).weak());
         }
+        if let Some(tmdb_id) = *self.matched_tmdb_id.lock().unwrap() {
+            let url = crate::sources::rivestream_embed_url(tmdb_id, self.prefs.is_movie, &self.season, &self.episode);
+            if ui.link("watch on rivestream").clicked() {
+                let _ = open::that(url);
+            }
+        } else if self.tmdb_api_key.trim().is_empty() {
+            ui.label(egui::RichText::new("add a TMDB API key in settings to get a rivestream watch link").weak());
+        }
         if let Some(cover) = self.prefs.cover.clone() {
             ui.add(egui::Image::from_uri(&cover).max_height(160.0).rounding(4.0));
             if ui.small_button("clear cover").clicked() {
                 self.prefs.cover = None;
                 *self.matched_name.lock().unwrap() = None;
+                *self.matched_url.lock().unwrap() = None;
+                *self.matched_tmdb_id.lock().unwrap() = None;
+                let mut shared = self.shared.lock().unwrap();
+                shared.url = None;
+                shared.tmdb_id = None;
                 changed = true;
             }
         }

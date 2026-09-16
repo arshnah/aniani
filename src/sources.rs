@@ -292,12 +292,13 @@ query ($search: String) {
   Media(search: $search, type: ANIME) {
     coverImage { extraLarge large }
     siteUrl
+    streamingEpisodes { title }
   }
 }
 "#;
 
 pub async fn discord_media_for(client: &reqwest::Client, title: &str) -> crate::discord::MediaInfo {
-    let empty = crate::discord::MediaInfo { image: None, url: None };
+    let empty = crate::discord::MediaInfo { image: None, url: None, episode_titles: Default::default() };
     let resp = match client
         .post(ANILIST_URL)
         .json(&json!({"query": DISCORD_MEDIA_QUERY, "variables": {"search": title}}))
@@ -331,7 +332,124 @@ pub async fn discord_media_for(client: &reqwest::Client, title: &str) -> crate::
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let url = media.get("siteUrl").and_then(|v| v.as_str()).map(|s| s.to_string());
-    crate::discord::MediaInfo { image, url }
+
+    // AniList's streamingEpisodes titles look like "Episode 9 - Emperor Dragon" for
+    // sites (Crunchyroll etc) that publish per-episode subtitles. Pull the number and
+    // the subtitle out so we can show "Emperor Dragon" instead of just "Episode 9".
+    let mut episode_titles = std::collections::HashMap::new();
+    if let Some(eps) = media.get("streamingEpisodes").and_then(|v| v.as_array()) {
+        for ep in eps {
+            let Some(raw) = ep.get("title").and_then(|v| v.as_str()) else { continue };
+            let Some(rest) = raw.strip_prefix("Episode ") else { continue };
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                continue;
+            }
+            let subtitle = rest[digits.len()..].trim_start_matches(|c: char| c == '-' || c == ' ').trim();
+            if !subtitle.is_empty() {
+                episode_titles.insert(digits, subtitle.to_string());
+            }
+        }
+    }
+
+    crate::discord::MediaInfo { image, url, episode_titles }
+}
+
+// Some ISPs (India, notably) hijack DNS for themoviedb.org to a walled-garden
+// page instead of returning NXDOMAIN or refusing the connection, so a normal
+// request just hangs/fails against a bogus IP. Cloudflare's DNS-over-HTTPS
+// resolver sees the real address, so fall back to it and pin the connection
+// to that IP directly, bypassing the system resolver for just this host.
+async fn doh_resolve(client: &reqwest::Client, host: &str) -> Option<std::net::IpAddr> {
+    let resp = client
+        .get("https://1.1.1.1/dns-query")
+        .header("accept", "application/dns-json")
+        .query(&[("name", host), ("type", "A")])
+        .send()
+        .await
+        .ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let ip_str = data.get("Answer")?.as_array()?.iter().find_map(|a| a.get("data")?.as_str())?;
+    ip_str.parse().ok()
+}
+
+async fn tmdb_client_bypassing_dns_block(fallback: &reqwest::Client) -> Option<reqwest::Client> {
+    let ip = doh_resolve(fallback, "api.themoviedb.org").await?;
+    reqwest::Client::builder()
+        .resolve("api.themoviedb.org", std::net::SocketAddr::new(ip, 443))
+        .build()
+        .ok()
+}
+
+async fn tmdb_get_json(client: &reqwest::Client, path: &str, params: &[(&str, &str)]) -> Option<serde_json::Value> {
+    let url = format!("https://api.themoviedb.org/3/{path}");
+    let resp = match client.get(&url).query(params).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            crate::platform::debug_log(&format!("tmdb {path}: request failed ({e}), retrying via DoH-resolved IP"));
+            let bypass = tmdb_client_bypassing_dns_block(client).await?;
+            bypass.get(&url).query(params).send().await.ok()?
+        }
+    };
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
+pub async fn tmdb_id_for(client: &reqwest::Client, api_key: &str, title: &str, is_movie: bool) -> Option<i64> {
+    if api_key.trim().is_empty() {
+        return None;
+    }
+    let kind = if is_movie { "movie" } else { "tv" };
+    let data = tmdb_get_json(client, &format!("search/{kind}"), &[("api_key", api_key), ("query", title)]).await?;
+    data.get("results")?.as_array()?.first()?.get("id")?.as_i64()
+}
+
+#[derive(Clone, Debug)]
+pub struct TmdbSearchResult {
+    pub id: i64,
+    pub title: String,
+    pub year: String,
+    pub is_movie: bool,
+}
+
+pub async fn tmdb_search(client: &reqwest::Client, api_key: &str, query: &str) -> Vec<TmdbSearchResult> {
+    if api_key.trim().is_empty() || query.trim().is_empty() {
+        return vec![];
+    }
+    let Some(data) = tmdb_get_json(client, "search/multi", &[("api_key", api_key), ("query", query)]).await else {
+        return vec![];
+    };
+    let Some(results) = data.get("results").and_then(|v| v.as_array()) else {
+        return vec![];
+    };
+    results
+        .iter()
+        .filter_map(|r| {
+            let media_type = r.get("media_type")?.as_str()?;
+            let is_movie = match media_type {
+                "movie" => true,
+                "tv" => false,
+                _ => return None,
+            };
+            let title = r.get(if is_movie { "title" } else { "name" })?.as_str()?.to_string();
+            let date = r.get(if is_movie { "release_date" } else { "first_air_date" }).and_then(|v| v.as_str()).unwrap_or("");
+            let year = date.get(..4).unwrap_or("").to_string();
+            let id = r.get("id")?.as_i64()?;
+            Some(TmdbSearchResult { id, title, year, is_movie })
+        })
+        .collect()
+}
+
+pub fn rivestream_embed_url(tmdb_id: i64, is_movie: bool, season: &str, episode: &str) -> String {
+    if is_movie {
+        format!("https://www.rivestream.app/embed?type=movie&id={tmdb_id}")
+    } else {
+        let season = if season.trim().is_empty() { "1" } else { season.trim() };
+        let episode = if episode.trim().is_empty() { "1" } else { episode.trim() };
+        format!("https://www.rivestream.app/embed?type=tv&id={tmdb_id}&season={season}&episode={episode}")
+    }
 }
 
 const ANIDB_BASE: &str = "https://anidb.app";

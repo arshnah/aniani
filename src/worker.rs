@@ -12,7 +12,7 @@ pub enum Cmd {
     SetBackend(String),
     Browsing(String),
     Reading(String, Option<String>),
-    WatchingShow { title: String, detail: String, cover: Option<String>, pos: f64, dur: f64, paused: bool, live: bool },
+    WatchingShow { title: String, detail: String, cover: Option<String>, url: Option<String>, pos: f64, dur: f64, paused: bool, live: bool },
     Seek(f64),
     SetVolume(i32),
     SetSpeed(f64),
@@ -76,8 +76,8 @@ impl PlayerHandle {
                     }
                     Ok(Cmd::Browsing(detail)) => discord.browsing(&detail),
                     Ok(Cmd::Reading(detail, cover)) => discord.reading(&detail, cover.as_deref()),
-                    Ok(Cmd::WatchingShow { title, detail, cover, pos, dur, paused, live }) => {
-                        discord.watching_show(&title, &detail, cover.as_deref(), pos, dur, paused, live)
+                    Ok(Cmd::WatchingShow { title, detail, cover, url, pos, dur, paused, live }) => {
+                        discord.watching_show(&title, &detail, cover.as_deref(), url.as_deref(), pos, dur, paused, live)
                     }
                     Ok(Cmd::Seek(seconds)) => backend.seek(seconds),
                     Ok(Cmd::SetVolume(percent)) => backend.set_volume(percent),
@@ -183,8 +183,8 @@ impl PlayerHandle {
         let _ = self.tx.send(Cmd::Reading(detail.to_string(), cover));
     }
 
-    pub fn watching_show(&self, title: &str, detail: &str, cover: Option<String>, pos: f64, dur: f64, paused: bool, live: bool) {
-        let _ = self.tx.send(Cmd::WatchingShow { title: title.to_string(), detail: detail.to_string(), cover, pos, dur, paused, live });
+    pub fn watching_show(&self, title: &str, detail: &str, cover: Option<String>, url: Option<String>, pos: f64, dur: f64, paused: bool, live: bool) {
+        let _ = self.tx.send(Cmd::WatchingShow { title: title.to_string(), detail: detail.to_string(), cover, url, pos, dur, paused, live });
     }
 
     pub fn seek(&self, seconds: f64) {

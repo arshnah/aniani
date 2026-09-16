@@ -38,6 +38,7 @@ enum SearchSource {
     AniDb,
     Yuma,
     Nyaa,
+    Rivestream,
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +87,8 @@ struct App {
     auto_select: Option<String>,
     yuma_results: Arc<Mutex<Vec<sources::SearchResult>>>,
     nyaa_results: Arc<Mutex<Vec<torrent::TorrentResult>>>,
+    rivestream_results: Arc<Mutex<Vec<sources::TmdbSearchResult>>>,
+    rivestream_tv_inputs: std::collections::HashMap<i64, (String, String)>,
 
     selected: Option<SelectedAnime>,
 
@@ -159,6 +162,8 @@ impl App {
             auto_select: None,
             yuma_results: Arc::new(Mutex::new(vec![])),
             nyaa_results: Arc::new(Mutex::new(vec![])),
+            rivestream_results: Arc::new(Mutex::new(vec![])),
+            rivestream_tv_inputs: std::collections::HashMap::new(),
             selected: None,
             player,
             torrent_engine: Arc::new(Mutex::new(torrent::TorrentEngine::new())),
@@ -306,6 +311,7 @@ impl App {
             SearchSource::AniDb => self.anidb_results.lock().unwrap().clear(),
             SearchSource::Yuma => self.yuma_results.lock().unwrap().clear(),
             SearchSource::Nyaa => self.nyaa_results.lock().unwrap().clear(),
+            SearchSource::Rivestream => self.rivestream_results.lock().unwrap().clear(),
         }
         *self.searching.lock().unwrap() = true;
         match self.search_source {
@@ -342,6 +348,18 @@ impl App {
                     if let Ok(v) = torrent::nyaa_search(&client, &q).await {
                         *out.lock().unwrap() = v;
                     }
+                    *searching.lock().unwrap() = false;
+                });
+            }
+            SearchSource::Rivestream => {
+                let q = self.search_query.clone();
+                let client = self.http.clone();
+                let api_key = self.prefs.tmdb_api_key.clone();
+                let out = self.rivestream_results.clone();
+                let searching = self.searching.clone();
+                self.rt.spawn(async move {
+                    let v = sources::tmdb_search(&client, &api_key, &q).await;
+                    *out.lock().unwrap() = v;
                     *searching.lock().unwrap() = false;
                 });
             }
@@ -1083,6 +1101,7 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.search_source, SearchSource::AniDb, "anidb (stream)");
                     ui.selectable_value(&mut self.search_source, SearchSource::Yuma, "aniwatch (stream, search only)");
                     ui.selectable_value(&mut self.search_source, SearchSource::Nyaa, "nyaa (torrent)");
+                    ui.selectable_value(&mut self.search_source, SearchSource::Rivestream, "rivestream (movies/tv)");
                     if self.search_source != source_before && !self.search_query.trim().is_empty() {
                         self.run_search();
                     }
@@ -1138,6 +1157,34 @@ impl eframe::App for App {
                                 ui.label(format!("↑{} ↓{} {}", r.seeders, r.leechers, r.size));
                                 if ui.button(&r.title).clicked() {
                                     self.play_torrent(&r.magnet, &r.title);
+                                }
+                            });
+                        }
+                    }
+                    SearchSource::Rivestream => {
+                        if self.prefs.tmdb_api_key.trim().is_empty() {
+                            ui.label(egui::RichText::new("add a TMDB API key in settings first").color(theme::MUTED));
+                        }
+                        let results = self.rivestream_results.lock().unwrap().clone();
+                        for r in &results {
+                            ui.horizontal(|ui| {
+                                let kind = if r.is_movie { "movie" } else { "tv" };
+                                ui.label(format!("{} ({}) · {}", r.title, r.year, kind));
+                                if r.is_movie {
+                                    if ui.button("watch").clicked() {
+                                        let url = sources::rivestream_embed_url(r.id, true, "", "");
+                                        let _ = open::that(url);
+                                    }
+                                } else {
+                                    let entry = self.rivestream_tv_inputs.entry(r.id).or_insert_with(|| ("1".to_string(), "1".to_string()));
+                                    ui.label("s");
+                                    ui.add(egui::TextEdit::singleline(&mut entry.0).desired_width(30.0));
+                                    ui.label("e");
+                                    ui.add(egui::TextEdit::singleline(&mut entry.1).desired_width(30.0));
+                                    if ui.button("watch").clicked() {
+                                        let url = sources::rivestream_embed_url(r.id, false, &entry.0, &entry.1);
+                                        let _ = open::that(url);
+                                    }
                                 }
                             });
                         }
@@ -1473,7 +1520,7 @@ impl eframe::App for App {
                 self.reader.ui(ui);
             }
             Tab::Shows => {
-                self.shows.ui(ui);
+                self.shows.ui(ui, &self.prefs.tmdb_api_key);
             }
             Tab::Settings => {
                 ui.heading("player");
@@ -1561,6 +1608,11 @@ impl eframe::App for App {
                         }
                     });
                 }
+
+                ui.separator();
+                ui.heading("rivestream");
+                ui.label("paste a free TMDB API key (from themoviedb.org/settings/api) to let the shows tracker link straight to a rivestream.app watch page:");
+                ui.text_edit_singleline(&mut self.prefs.tmdb_api_key);
 
                 ui.separator();
                 ui.heading("system dependencies");
